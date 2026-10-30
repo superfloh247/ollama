@@ -109,6 +109,14 @@ func (mockRunner) Tokenize(_ context.Context, s string) (tokens []int, err error
 	return
 }
 
+func testLogprobs(tokens ...string) []llm.Logprob {
+	logprobs := make([]llm.Logprob, len(tokens))
+	for i, token := range tokens {
+		logprobs[i].Token = token
+	}
+	return logprobs
+}
+
 func (mockRunner) Ping(_ context.Context) error { return nil }
 
 func (m mockRunner) ContextLength() int { return m.contextLength }
@@ -447,7 +455,11 @@ func TestChatMetricsIncludeFinalParsedChunk(t *testing.T) {
 
 	mock := &mockRunner{
 		CompletionFn: func(_ context.Context, _ llm.CompletionRequest, fn func(llm.CompletionResponse)) error {
-			fn(llm.CompletionResponse{Content: "<think>reasoning ", EvalCount: 2})
+			fn(llm.CompletionResponse{
+				Content:   "<think>reasoning ",
+				Logprobs:  testLogprobs("<think>", "reason", "ing", " "),
+				EvalCount: 2,
+			})
 			fn(llm.CompletionResponse{
 				Content:         "one two</think>answer done",
 				Done:            true,
@@ -455,6 +467,7 @@ func TestChatMetricsIncludeFinalParsedChunk(t *testing.T) {
 				PromptEvalCount: 7,
 				EvalCount:       10,
 				EvalDuration:    time.Second,
+				Logprobs:        testLogprobs("one", " ", "two", "</think>", "answer", " done"),
 			})
 			return nil
 		},
@@ -493,13 +506,19 @@ func TestChatMetricsIncludeFinalParsedChunk(t *testing.T) {
 	if response.Code != http.StatusOK {
 		t.Fatalf("chat status %d: %s", response.Code, response.Body.String())
 	}
+	if !mock.CompletionRequest.Logprobs {
+		t.Fatal("expected metrics logging to enable internal logprob capture")
+	}
+	if strings.Contains(response.Body.String(), "logprobs") {
+		t.Fatal("internal logprobs were exposed in the response")
+	}
 
 	entry := readTokenMetricsEntry(t, path)
-	if got := entry["generated_tokens_reasoning"].(float64); got != 6 {
-		t.Errorf("reasoning tokens = %v, want 6 (including the final parser chunk)", got)
+	if got := entry["generated_tokens_reasoning"].(float64); got != 8 {
+		t.Errorf("reasoning tokens = %v, want 8 (including the final parser chunk)", got)
 	}
-	if got := entry["generated_tokens_answer"].(float64); got != 4 {
-		t.Errorf("answer tokens = %v, want 4 (including the final parser chunk)", got)
+	if got := entry["generated_tokens_answer"].(float64); got != 2 {
+		t.Errorf("answer tokens = %v, want 2 (including the final parser chunk)", got)
 	}
 	if got := entry["generated_tokens"].(float64); got != 10 {
 		t.Errorf("generated total = %v, want 10", got)
@@ -519,13 +538,21 @@ func TestNativeChatMetricsUseStructuredReasoningAndToolCalls(t *testing.T) {
 	args.Set("city", "Paris")
 	mock := &mockRunner{
 		ChatFn: func(_ context.Context, _ llm.ChatRequest, fn func(llm.ChatResponse)) error {
-			fn(llm.ChatResponse{Message: api.Message{Role: "assistant", Thinking: "private reasoning"}})
-			fn(llm.ChatResponse{Message: api.Message{
-				Role: "assistant",
-				ToolCalls: []api.ToolCall{{
-					Function: api.ToolCallFunction{Name: "weather", Arguments: args},
-				}},
-			}})
+			fn(llm.ChatResponse{
+				Message:              api.Message{Role: "assistant", Thinking: "private reasoning"},
+				Logprobs:             testLogprobs("priv", "ate", " reason", "ing"),
+				GeneratedTokenPhases: []string{"thinking", "thinking", "thinking", "thinking"},
+			})
+			fn(llm.ChatResponse{
+				Message: api.Message{
+					Role: "assistant",
+					ToolCalls: []api.ToolCall{{
+						Function: api.ToolCallFunction{Name: "weather", Arguments: args},
+					}},
+				},
+				Logprobs:             testLogprobs("weather", "(", "Paris", ")"),
+				GeneratedTokenPhases: []string{"toolCalling", "toolCalling", "toolCalling", "toolCalling"},
+			})
 			fn(llm.ChatResponse{
 				Message:         api.Message{Role: "assistant", Content: "answer words"},
 				Done:            true,
@@ -533,6 +560,10 @@ func TestNativeChatMetricsUseStructuredReasoningAndToolCalls(t *testing.T) {
 				PromptEvalCount: 4,
 				EvalCount:       12,
 				EvalDuration:    time.Second,
+				Logprobs:        testLogprobs("answer", " ", "words", "."),
+				GeneratedTokenPhases: []string{
+					"answer", "answer", "answer", "answer",
+				},
 			})
 			return nil
 		},
@@ -564,13 +595,19 @@ func TestNativeChatMetricsUseStructuredReasoningAndToolCalls(t *testing.T) {
 	if mock.ChatRequest.Messages == nil {
 		t.Fatal("expected native chat route")
 	}
+	if !mock.ChatRequest.Logprobs {
+		t.Fatal("expected metrics logging to enable internal logprob capture")
+	}
+	if strings.Contains(response.Body.String(), "logprobs") {
+		t.Fatal("internal logprobs were exposed in the response")
+	}
 
 	entry := readTokenMetricsEntry(t, path)
 	reasoning := entry["generated_tokens_reasoning"].(float64)
 	toolCalls := entry["generated_tokens_tool_calls"].(float64)
 	answer := entry["generated_tokens_answer"].(float64)
-	if reasoning <= 0 || toolCalls <= 0 || answer <= 0 || reasoning+toolCalls+answer != 12 {
-		t.Errorf("native split = reasoning %v, tool calls %v, answer %v; want positive parts summing to 12",
+	if reasoning != 4 || toolCalls != 4 || answer != 4 {
+		t.Errorf("native split = reasoning %v, tool calls %v, answer %v; want exactly 4 each",
 			reasoning, toolCalls, answer)
 	}
 	if got := entry["time_to_first_token_ms"].(float64); got <= 0 {

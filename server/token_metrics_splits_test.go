@@ -1,11 +1,12 @@
 package server
 
 import (
-	"context"
-	"errors"
-	"strings"
 	"testing"
 	"time"
+
+	"github.com/ollama/ollama/api"
+	"github.com/ollama/ollama/llm"
+	"github.com/ollama/ollama/model/parsers"
 )
 
 // fakeSplitParser is a [StateProvider] with fixed per-phase content byte counts.
@@ -19,80 +20,85 @@ func (p fakeSplitParser) ThinkingTokens() int { return p.thinkingTokens }
 func (p fakeSplitParser) ToolCallTokens() int { return p.toolCallTokens }
 func (p fakeSplitParser) AnswerTokens() int   { return p.answerTokens }
 
-func TestCountGeneratedTokenPhasesUsesTokenizer(t *testing.T) {
-	text := generatedTokenText{}
-	text.addReasoning("reasoning bytes")
-	text.toolCalls.WriteString("tool call bytes")
-	text.addAnswer("answer bytes")
+func TestAddParserTokensCountsExactPhaseTokens(t *testing.T) {
+	parser := parsers.ParserForName("qwen3.5")
+	parser.Init(nil, nil, &api.ThinkValue{Value: true})
+	tokens := []llm.Logprob{
+		{TokenLogprob: llm.TokenLogprob{Token: "reason"}},
+		{TokenLogprob: llm.TokenLogprob{Token: "</think>"}},
+		{TokenLogprob: llm.TokenLogprob{Token: "answer"}},
+	}
+	counts := newGeneratedTokenCounts(true)
 
-	counts, err := countGeneratedTokenPhases(context.Background(), 50,
-		func(_ context.Context, content string) ([]int, error) {
-			switch content {
-			case "reasoning bytes":
-				return []int{1, 2, 3}, nil
-			case "tool call bytes":
-				return []int{1}, nil
-			case "answer bytes":
-				return []int{1, 2, 3, 4, 5, 6}, nil
-			default:
-				t.Fatalf("unexpected tokenizer input %q", content)
-				return nil, nil
-			}
-		}, text)
+	content, thinking, _, err := addParserTokens(parser, "reason</think>answer", true, tokens, counts, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if counts != (generatedTokenCounts{reasoning: 15, toolCalls: 5, answer: 30}) {
-		t.Errorf("counts = %+v, want reasoning 15, tool calls 5, answer 30", counts)
+	if content != "answer" || thinking != "reason" {
+		t.Errorf("parsed content/thinking = %q/%q, want %q/%q", content, thinking, "answer", "reason")
 	}
-	if counts.reasoning+counts.toolCalls+counts.answer != 50 {
-		t.Errorf("phase counts sum to %d, want runner count 50", counts.reasoning+counts.toolCalls+counts.answer)
+	if counts.reasoning != 2 || counts.toolCalls != 0 || counts.answer != 1 || counts.total != 3 || !counts.complete {
+		t.Errorf("counts = %+v, want exactly 2 reasoning and 1 answer token", counts)
 	}
 }
 
-func TestCountGeneratedTokenPhasesFallbackAndErrors(t *testing.T) {
-	t.Run("no parsed content is attributed to answer", func(t *testing.T) {
-		counts, err := countGeneratedTokenPhases(context.Background(), 9,
-			func(context.Context, string) ([]int, error) {
-				t.Fatal("tokenizer called without phase content")
-				return nil, nil
-			}, generatedTokenText{})
-		if err != nil {
-			t.Fatal(err)
-		}
-		if counts != (generatedTokenCounts{answer: 9}) {
-			t.Errorf("counts = %+v, want all 9 tokens attributed to answer", counts)
-		}
-	})
+func TestAddParserTokensCountsToolCallTokens(t *testing.T) {
+	parser := parsers.ParserForName("qwen3-coder")
+	parser.Init([]api.Tool{{Function: api.ToolFunction{Name: "weather"}}}, nil, nil)
+	tokens := []llm.Logprob{
+		{TokenLogprob: llm.TokenLogprob{Token: "hello"}},
+		{TokenLogprob: llm.TokenLogprob{Token: "<tool_call>\n"}},
+		{TokenLogprob: llm.TokenLogprob{Token: "<function=weather>\n"}},
+		{TokenLogprob: llm.TokenLogprob{Token: "<parameter=city>\n"}},
+		{TokenLogprob: llm.TokenLogprob{Token: "Paris\n"}},
+		{TokenLogprob: llm.TokenLogprob{Token: "</parameter>\n"}},
+		{TokenLogprob: llm.TokenLogprob{Token: "</function>\n"}},
+		{TokenLogprob: llm.TokenLogprob{Token: "</tool_call>"}},
+		{TokenLogprob: llm.TokenLogprob{Token: "done"}},
+	}
+	counts := newGeneratedTokenCounts(true)
 
-	t.Run("tokenization errors are returned", func(t *testing.T) {
-		text := generatedTokenText{}
-		text.addReasoning("reason")
-		wantErr := errors.New("tokenizer failed")
-		_, err := countGeneratedTokenPhases(context.Background(), 1,
-			func(context.Context, string) ([]int, error) { return nil, wantErr }, text)
-		if !errors.Is(err, wantErr) {
-			t.Errorf("error = %v, want %v", err, wantErr)
-		}
-	})
+	content, _, calls, err := addParserTokens(parser, "hello<tool_call>\n<function=weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call>done", true, tokens, counts, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if content != "hellodone" || len(calls) != 1 || calls[0].Function.Name != "weather" {
+		t.Fatalf("parsed content/calls = %q/%+v, want %q and one weather call", content, calls, "hellodone")
+	}
+	if counts.reasoning != 0 || counts.toolCalls != 7 || counts.answer != 2 || counts.total != 9 || !counts.complete {
+		t.Errorf("counts = %+v, want 7 tool-call and 2 answer tokens", counts)
+	}
+}
 
-	t.Run("phase text is concatenated before tokenization", func(t *testing.T) {
-		text := generatedTokenText{}
-		text.addAnswer("answer")
-		text.addAnswer(" continues")
-		var got string
-		counts, err := countGeneratedTokenPhases(context.Background(), 2,
-			func(_ context.Context, content string) ([]int, error) {
-				got = content
-				return make([]int, len(strings.Fields(content))), nil
-			}, text)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if got != "answer continues" || counts.answer != 2 {
-			t.Errorf("tokenized %q, counts %+v; want %q and two answer tokens", got, counts, "answer continues")
-		}
-	})
+func TestAddParserTokensRejectsUnalignedTokenData(t *testing.T) {
+	parser := parsers.ParserForName("passthrough")
+	parser.Init(nil, nil, nil)
+	counts := newGeneratedTokenCounts(true)
+
+	content, _, _, err := addParserTokens(parser, "actual output", true, []llm.Logprob{
+		{TokenLogprob: llm.TokenLogprob{Token: "different"}},
+	}, counts, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if content != "actual output" {
+		t.Errorf("content = %q, want raw response unchanged", content)
+	}
+	if counts.complete {
+		t.Fatal("expected accounting to be incomplete when token text does not match response content")
+	}
+}
+
+func TestGeneratedTokenCountsRejectUnknownPhases(t *testing.T) {
+	counts := newGeneratedTokenCounts(true)
+	counts.addToken("")
+
+	if counts.complete || counts.total != 1 {
+		t.Fatalf("counts = %+v, want incomplete accounting with one observed token", counts)
+	}
+	if counts.reasoning != 0 || counts.toolCalls != 0 || counts.answer != 0 {
+		t.Fatalf("unknown phase was attributed to a known phase: %+v", counts)
+	}
 }
 
 func TestSplitDurations(t *testing.T) {

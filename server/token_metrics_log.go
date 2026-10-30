@@ -1,7 +1,6 @@
 package server
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -204,24 +203,24 @@ func (s *Server) logTokenMetrics(model string, m api.Metrics, timing MetricsTimi
 	}
 }
 
-func (s *Server) logTokenMetricsWithTokenizer(
-	ctx context.Context,
+func (s *Server) logTokenMetricsWithCounts(
 	model string,
 	m api.Metrics,
 	timing MetricsTiming,
-	tokenize func(context.Context, string) ([]int, error),
-	text *generatedTokenText,
+	counts *generatedTokenCounts,
 ) {
 	if s.metricsLogger == nil {
 		return
 	}
-	if text == nil {
-		text = &generatedTokenText{}
-	}
-	counts, err := countGeneratedTokenPhases(ctx, m.EvalCount, tokenize, *text)
-	if err != nil {
-		slog.Warn("failed to tokenize generated token phases", "model", model, "error", err)
+	if counts == nil || !counts.complete || counts.total != m.EvalCount {
+		slog.Warn("skipping token metrics because per-token phase accounting is incomplete",
+			"model", model, "captured_tokens", func() int {
+				if counts == nil {
+					return 0
+				}
+				return counts.total
+			}(), "generated_tokens", m.EvalCount)
 		return
 	}
-	s.logTokenMetrics(model, m, timing, counts)
+	s.logTokenMetrics(model, m, timing, *counts)
 }

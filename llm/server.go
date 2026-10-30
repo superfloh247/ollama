@@ -246,6 +246,7 @@ type ChatResponse struct {
 	EvalCount             int           `json:"eval_count"`
 	EvalDuration          time.Duration `json:"eval_duration"`
 	Logprobs              []Logprob     `json:"logprobs,omitempty"`
+	GeneratedTokenPhases  []string      `json:"-"`
 }
 
 // DoneReason represents the reason why a completion response is done

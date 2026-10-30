@@ -47,7 +47,26 @@ type Nemotron3NanoParser struct {
 // transitioned to a different state, or the zero time if no transition has
 // happened yet.
 func (p *Nemotron3NanoParser) StateTransitionTime() time.Time {
+	if p.toolParser != nil {
+		if transition := p.toolParser.StateTransitionTime(); transition.After(p.stateTransition) {
+			return transition
+		}
+	}
 	return p.stateTransition
+}
+
+func (p *Nemotron3NanoParser) StateName() string {
+	if p.toolParser != nil && p.toolParser.StateName() == phaseToolCalling {
+		return phaseToolCalling
+	}
+	switch p.state {
+	case Nemotron3NanoCollectingThinking:
+		return phaseThinking
+	case Nemotron3NanoSkipWhitespaceAfterThinking:
+		return phaseThinkingDone
+	default:
+		return phaseAnswer
+	}
 }
 
 // ThinkingTokens returns the number of thinking-content bytes attributed to

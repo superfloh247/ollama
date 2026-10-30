@@ -130,6 +130,8 @@ On Windows, Ollama inherits your user and system environment variables.
 
 Set `OLLAMA_LOG_METRICS=1` to write metrics for completed inference requests to a JSONL file. Each line contains the model, input and generated token counts (including reasoning, tool-call, and answer counts), and timing and token-rate metadata. Prompt and response content are not included.
 
+To attribute generated tokens to each phase, Ollama captures per-token log probabilities while metrics logging is enabled. This adds inference overhead; the captured values are not returned in API responses unless requested.
+
 By default, the file is `tokenmetrics.log` in Ollama's log directory: `~/.ollama/logs` on macOS and Linux, or `%LOCALAPPDATA%\Ollama\logs` on Windows. Set `OLLAMA_METRICS_LOG_FILE` to choose a different file path. This variable only takes effect when metrics logging is enabled.
 
 For example, to enable logging and write to a custom path when starting the server:

@@ -2,6 +2,7 @@ package parsers
 
 import (
 	"strings"
+	"time"
 	"unicode"
 
 	"github.com/ollama/ollama/api"
@@ -20,9 +21,10 @@ const (
 // model decides for itself whether to open with a <think> block, so the block
 // is optional; tool calls use the Qwen3-Coder XML format.
 type LFM3AudioParser struct {
-	content Qwen3CoderParser
-	state   lfm3AudioState
-	buf     strings.Builder
+	content         Qwen3CoderParser
+	state           lfm3AudioState
+	buf             strings.Builder
+	stateTransition time.Time
 	// filter removes reasoning the model still emits with thinking off.
 	filter *lfm3ThinkFilter
 }
@@ -30,6 +32,26 @@ type LFM3AudioParser struct {
 func (p *LFM3AudioParser) HasToolSupport() bool     { return true }
 func (p *LFM3AudioParser) HasThinkingSupport() bool { return false }
 func (p *LFM3AudioParser) ThinkingClose() []string  { return nil }
+func (p *LFM3AudioParser) StateTransitionTime() time.Time {
+	if p.state == lfm3AudioContent {
+		if transition := p.content.StateTransitionTime(); transition.After(p.stateTransition) {
+			return transition
+		}
+	}
+	return p.stateTransition
+}
+func (p *LFM3AudioParser) StateName() string {
+	switch p.state {
+	case lfm3AudioThinking:
+		return phaseThinking
+	case lfm3AudioAfterThinking:
+		return phaseThinkingDone
+	case lfm3AudioContent:
+		return p.content.StateName()
+	default:
+		return phaseAnswer
+	}
+}
 func (p *LFM3AudioParser) PreservedTokens() []string {
 	return []string{"<think>", "</think>", toolOpenTag, toolCloseTag}
 }
@@ -39,6 +61,7 @@ func (p *LFM3AudioParser) Init(tools []api.Tool, lastMessage *api.Message, think
 	p.content = Qwen3CoderParser{}
 	p.content.Init(tools, nil, nil)
 	p.filter = nil
+	p.stateTransition = time.Time{}
 	switch {
 	case lastMessage != nil && lastMessage.Role == "assistant" && lastMessage.Content != "":
 		// The renderer continues a trailing assistant message.
@@ -53,6 +76,14 @@ func (p *LFM3AudioParser) Init(tools []api.Tool, lastMessage *api.Message, think
 		p.state = lfm3AudioStart
 	}
 	return tools
+}
+
+func (p *LFM3AudioParser) setState(next lfm3AudioState) {
+	if p.state == next {
+		return
+	}
+	p.stateTransition = time.Now()
+	p.state = next
 }
 
 func (p *LFM3AudioParser) Add(s string, done bool) (content, thinking string, calls []api.ToolCall, err error) {
@@ -73,7 +104,7 @@ func (p *LFM3AudioParser) Add(s string, done bool) (content, thinking string, ca
 			if p.state == lfm3AudioStart {
 				if rest, ok := strings.CutPrefix(trimmed, "<think>"); ok {
 					p.reset(rest)
-					p.state = lfm3AudioThinking
+					p.setState(lfm3AudioThinking)
 					continue
 				}
 				if strings.HasPrefix("<think>", trimmed) && !done {
@@ -81,12 +112,12 @@ func (p *LFM3AudioParser) Add(s string, done bool) (content, thinking string, ca
 				}
 			}
 			p.reset(trimmed)
-			p.state = lfm3AudioContent
+			p.setState(lfm3AudioContent)
 		case lfm3AudioThinking:
 			if before, after, ok := strings.Cut(text, "</think>"); ok {
 				think.WriteString(before)
 				p.reset(after)
-				p.state = lfm3AudioAfterThinking
+				p.setState(lfm3AudioAfterThinking)
 				continue
 			}
 			keep := 0

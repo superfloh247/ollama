@@ -154,6 +154,10 @@ func (p *PassthroughParser) HasThinkingSupport() bool {
 	return false
 }
 
+func (p *PassthroughParser) StateName() string {
+	return phaseAnswer
+}
+
 func splitAtTag(sb *strings.Builder, tag string, trimAfter bool) (string, string) {
 	split := strings.SplitN(sb.String(), tag, 2)
 	if len(split) == 1 {

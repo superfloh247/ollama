@@ -3,6 +3,7 @@ package parsers
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/ollama/ollama/api"
 )
@@ -45,6 +46,73 @@ func FuzzLFM3AudioParser(f *testing.F) {
 			t.Fatalf("thinking %q with thinking off", t1+t2)
 		}
 	})
+}
+
+func TestLFM3AudioParserStateTransitions(t *testing.T) {
+	p := ParserForName("lfm3-audio")
+	tools := []api.Tool{{Function: api.ToolFunction{Name: "get_weather"}}}
+	p.Init(tools, nil, nil)
+
+	state, ok := p.(interface {
+		StateName() string
+		StateTransitionTime() time.Time
+	})
+	if !ok {
+		t.Fatal("parser does not expose state transitions")
+	}
+	if got := state.StateName(); got != phaseAnswer {
+		t.Fatalf("initial state = %q, want %q", got, phaseAnswer)
+	}
+
+	if _, _, _, err := p.Add("<think>", false); err != nil {
+		t.Fatal(err)
+	}
+	if got := state.StateName(); got != phaseThinking {
+		t.Fatalf("state after thinking opener = %q, want %q", got, phaseThinking)
+	}
+	if _, _, _, err := p.Add("reasoning</think>", false); err != nil {
+		t.Fatal(err)
+	}
+	if got := state.StateName(); got != phaseThinkingDone {
+		t.Fatalf("state after thinking close = %q, want %q", got, phaseThinkingDone)
+	}
+	if state.StateTransitionTime().IsZero() {
+		t.Fatal("expected a thinking transition timestamp")
+	}
+	if _, _, _, err := p.Add("answer", true); err != nil {
+		t.Fatal(err)
+	}
+	if got := state.StateName(); got != phaseAnswer {
+		t.Fatalf("final state = %q, want %q", got, phaseAnswer)
+	}
+
+	p.Init(tools, nil, nil)
+	if _, _, _, err := p.Add("<tool_call>", false); err != nil {
+		t.Fatal(err)
+	}
+	if got := state.StateName(); got != phaseToolCalling {
+		t.Fatalf("tool state = %q, want %q", got, phaseToolCalling)
+	}
+	if state.StateTransitionTime().IsZero() {
+		t.Fatal("expected a tool-call transition timestamp")
+	}
+
+	p.Init(nil, nil, &api.ThinkValue{Value: true})
+	if got := state.StateName(); got != phaseThinking {
+		t.Fatalf("thinking prefill state = %q, want %q", got, phaseThinking)
+	}
+	if _, _, _, err := p.Add("reasoning</think>", false); err != nil {
+		t.Fatal(err)
+	}
+	if got := state.StateName(); got != phaseThinkingDone {
+		t.Fatalf("state after thinking close = %q, want %q", got, phaseThinkingDone)
+	}
+	if state.StateTransitionTime().IsZero() {
+		t.Fatal("expected a transition timestamp after thinking")
+	}
+	if _, _, _, err := p.Add("answer", true); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestLFM3AudioParserEverySplit(t *testing.T) {

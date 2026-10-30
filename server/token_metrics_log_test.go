@@ -220,6 +220,30 @@ func TestLogTokenMetrics(t *testing.T) {
 	}
 }
 
+func TestLogTokenMetricsSkipsIncompleteTokenAccounting(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "tokenmetrics.log")
+	logger, err := newTokenMetricsLogger(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer logger.Close()
+
+	server := &Server{metricsLogger: logger}
+	server.logTokenMetricsWithCounts("test-model", api.Metrics{EvalCount: 3}, MetricsTiming{}, &generatedTokenCounts{
+		reasoning: 1,
+		answer:    1,
+		total:     2,
+		complete:  true,
+	})
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(data) != 0 {
+		t.Fatalf("metrics log = %q, want no row for incomplete token accounting", data)
+	}
+}
+
 func TestLogTokenMetricsNoOpWhenDisabled(t *testing.T) {
 	s := &Server{metricsLogger: nil}
 	s.logTokenMetrics("test-model", api.Metrics{PromptEvalCount: 10, EvalCount: 5}, MetricsTiming{}, generatedTokenCounts{answer: 5})

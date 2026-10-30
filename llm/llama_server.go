@@ -1874,6 +1874,7 @@ func (s *llamaServerRunner) Completion(ctx context.Context, req CompletionReques
 					PromptEvalDuration:    time.Duration(lsResp.Timings.PromptMS * float64(time.Millisecond)),
 					EvalCount:             lsResp.Timings.PredictN,
 					EvalDuration:          time.Duration(lsResp.Timings.PredictMS * float64(time.Millisecond)),
+					Logprobs:              convertLogprobs(lsResp.CompletionProbabilities, req.TopLogprobs > 0),
 				}
 				hasFinalResp = true
 			}
@@ -2149,6 +2150,16 @@ func (s *llamaServerRunner) Chat(ctx context.Context, req ChatRequest, fn func(C
 					Thinking: choice.Delta.ReasoningContent,
 				},
 				Logprobs: convertLogprobs(choice.Logprobs.Content, req.TopLogprobs > 0),
+			}
+			phase := "answer"
+			switch {
+			case choice.Delta.ReasoningContent != "":
+				phase = "thinking"
+			case len(choice.Delta.ToolCalls) > 0:
+				phase = "toolCalling"
+			}
+			for range resp.Logprobs {
+				resp.GeneratedTokenPhases = append(resp.GeneratedTokenPhases, phase)
 			}
 
 			for _, tc := range choice.Delta.ToolCalls {

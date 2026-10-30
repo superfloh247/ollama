@@ -1,14 +1,14 @@
 package server
 
 import (
-	"context"
-	"encoding/json"
-	"errors"
-	"fmt"
 	"strings"
 	"time"
 
 	"github.com/ollama/ollama/api"
+	"github.com/ollama/ollama/llm"
+	"github.com/ollama/ollama/model/parsers"
+	"github.com/ollama/ollama/thinking"
+	"github.com/ollama/ollama/tools"
 )
 
 // StateProvider exposes parser-measured per-phase content sizes used to
@@ -30,89 +30,228 @@ type generatedTokenCounts struct {
 	reasoning int
 	toolCalls int
 	answer    int
+	total     int
+	complete  bool
 }
 
-type generatedTokenText struct {
-	reasoning strings.Builder
-	toolCalls strings.Builder
-	answer    strings.Builder
-}
-
-func newGeneratedTokenText(enabled bool) *generatedTokenText {
+func newGeneratedTokenCounts(enabled bool) *generatedTokenCounts {
 	if !enabled {
 		return nil
 	}
-	return &generatedTokenText{}
+	return &generatedTokenCounts{complete: true}
 }
 
-func (g *generatedTokenText) addReasoning(s string) {
-	if g != nil {
-		g.reasoning.WriteString(s)
+func (c *generatedTokenCounts) addToken(phase string) {
+	if c == nil {
+		return
+	}
+	switch phase {
+	case phaseStateThinking, phaseStateThinkingDone:
+		c.reasoning++
+	case phaseStateToolCalling:
+		c.toolCalls++
+	case phaseStateAnswer:
+		c.answer++
+	default:
+		c.complete = false
+	}
+	c.total++
+}
+
+func tokenPhase(before, after string) string {
+	if !knownTokenPhase(before) || !knownTokenPhase(after) {
+		return ""
+	}
+	if before == phaseStateThinking {
+		return phaseStateThinking
+	}
+	if before == phaseStateToolCalling || after == phaseStateToolCalling {
+		return phaseStateToolCalling
+	}
+	if after == phaseStateThinking {
+		return phaseStateThinking
+	}
+	return phaseStateAnswer
+}
+
+func knownTokenPhase(phase string) bool {
+	switch phase {
+	case phaseStateThinking, phaseStateThinkingDone, phaseStateToolCalling, phaseStateAnswer:
+		return true
+	default:
+		return false
 	}
 }
 
-func (g *generatedTokenText) addAnswer(s string) {
-	if g != nil {
-		g.answer.WriteString(s)
+func parserPhase(parser any) string {
+	if p, ok := parser.(interface{ StateName() string }); ok {
+		return p.StateName()
 	}
+	return ""
 }
 
-func (g *generatedTokenText) addToolCalls(calls []api.ToolCall) error {
-	if g == nil {
-		return nil
+func generatedTokensMatch(content string, tokens []llm.Logprob) bool {
+	if len(tokens) == 0 {
+		return content == ""
 	}
-	for _, call := range calls {
-		args, err := json.Marshal(call.Function.Arguments)
+	var reconstructed strings.Builder
+	for _, token := range tokens {
+		reconstructed.WriteString(token.Token)
+	}
+	return reconstructed.String() == content
+}
+
+func addParserTokens(parser parsers.Parser, content string, done bool, tokens []llm.Logprob, counts *generatedTokenCounts, clock *PhaseClock) (parsedContent, parsedThinking string, calls []api.ToolCall, err error) {
+	if counts == nil {
+		return parser.Add(content, done)
+	}
+	if !generatedTokensMatch(content, tokens) {
+		counts.complete = false
+		return parser.Add(content, done)
+	}
+	if len(tokens) == 0 {
+		return parser.Add(content, done)
+	}
+	var contentBuilder, thinkingBuilder strings.Builder
+	for i, token := range tokens {
+		before := parserPhase(parser)
+		content, thinking, parsedCalls, err := parser.Add(token.Token, done && i == len(tokens)-1)
 		if err != nil {
-			return fmt.Errorf("marshal tool-call arguments: %w", err)
+			return "", "", nil, err
 		}
-		fmt.Fprintf(&g.toolCalls, "<tool_call><function=%s>\n%s\n</function></tool_call>", call.Function.Name, args)
+		notePhaseClock(clock, parser)
+		counts.addToken(tokenPhase(before, parserPhase(parser)))
+		contentBuilder.WriteString(content)
+		thinkingBuilder.WriteString(thinking)
+		calls = append(calls, parsedCalls...)
 	}
-	return nil
+	return contentBuilder.String(), thinkingBuilder.String(), calls, nil
 }
 
-func countGeneratedTokenPhases(
-	ctx context.Context,
-	evalCount int,
-	tokenize func(context.Context, string) ([]int, error),
-	text generatedTokenText,
-) (generatedTokenCounts, error) {
-	var counts generatedTokenCounts
-	if evalCount <= 0 {
-		return counts, nil
+func addThinkingTokens(parser *thinking.Parser, content string, done bool, tokens []llm.Logprob, counts *generatedTokenCounts, clock *PhaseClock) (reasoning, answer string) {
+	if counts == nil {
+		return parser.AddContent(content)
 	}
-	if tokenize == nil {
-		return counts, errors.New("tokenizer is required to count generated token phases")
+	if !generatedTokensMatch(content, tokens) {
+		counts.complete = false
+		return parser.AddContent(content)
+	}
+	if len(tokens) == 0 {
+		return parser.AddContent(content)
+	}
+	var reasoningBuilder, answerBuilder strings.Builder
+	for _, token := range tokens {
+		before := parser.StateName()
+		thought, remaining := parser.AddContent(token.Token)
+		notePhaseClock(clock, parser)
+		counts.addToken(tokenPhase(before, parser.StateName()))
+		reasoningBuilder.WriteString(thought)
+		answerBuilder.WriteString(remaining)
+	}
+	if done {
+		thought, remaining := parser.AddContent("")
+		reasoningBuilder.WriteString(thought)
+		answerBuilder.WriteString(remaining)
+	}
+	return reasoningBuilder.String(), answerBuilder.String()
+}
+
+func addThinkingAndToolTokens(
+	thinkingParser *thinking.Parser,
+	toolParser *tools.Parser,
+	content string,
+	done bool,
+	tokens []llm.Logprob,
+	counts *generatedTokenCounts,
+	clock *PhaseClock,
+) (reasoning, answer string, calls []api.ToolCall) {
+	if counts == nil {
+		reasoning, answer = thinkingParser.AddContent(content)
+		calls, answer = toolParser.Add(answer)
+		return
+	}
+	if !generatedTokensMatch(content, tokens) {
+		counts.complete = false
+		reasoning, answer = thinkingParser.AddContent(content)
+		calls, answer = toolParser.Add(answer)
+		return
+	}
+	if len(tokens) == 0 {
+		reasoning, answer = thinkingParser.AddContent(content)
+		calls, answer = toolParser.Add(answer)
+		return
 	}
 
-	for _, phase := range []struct {
-		content string
-		count   *int
-	}{
-		{text.reasoning.String(), &counts.reasoning},
-		{text.toolCalls.String(), &counts.toolCalls},
-		{text.answer.String(), &counts.answer},
-	} {
-		if phase.content == "" {
-			continue
+	var reasoningBuilder, answerBuilder strings.Builder
+	for i, token := range tokens {
+		thinkingBefore := thinkingParser.StateName()
+		toolBefore := toolParser.StateName()
+		thought, remaining := thinkingParser.AddContent(token.Token)
+		notePhaseClock(clock, thinkingParser)
+		var parsedCalls []api.ToolCall
+		var parsedContent string
+		if remaining != "" {
+			parsedCalls, parsedContent = toolParser.Add(remaining)
+			notePhaseClock(clock, toolParser)
 		}
-		tokens, err := tokenize(ctx, phase.content)
-		if err != nil {
-			return generatedTokenCounts{}, err
+		thinkingAfter := thinkingParser.StateName()
+		toolAfter := toolParser.StateName()
+		phase := tokenPhase(thinkingBefore, thinkingAfter)
+		if thinkingBefore != phaseStateThinking && thinkingBefore != phaseStateThinkingDone &&
+			thinkingAfter != phaseStateThinking && thinkingAfter != phaseStateThinkingDone {
+			phase = tokenPhase(toolBefore, toolAfter)
 		}
-		*phase.count = len(tokens)
+		counts.addToken(phase)
+		reasoningBuilder.WriteString(thought)
+		answerBuilder.WriteString(parsedContent)
+		calls = append(calls, parsedCalls...)
+		if done && i == len(tokens)-1 {
+			thought, remaining = thinkingParser.AddContent("")
+			reasoningBuilder.WriteString(thought)
+			if remaining != "" {
+				parsedCalls, parsedContent = toolParser.Add(remaining)
+				calls = append(calls, parsedCalls...)
+				answerBuilder.WriteString(parsedContent)
+			}
+		}
 	}
+	return reasoningBuilder.String(), answerBuilder.String(), calls
+}
 
-	total := counts.reasoning + counts.toolCalls + counts.answer
-	if total == 0 {
-		counts.answer = evalCount
-		return counts, nil
+func addToolTokens(parser *tools.Parser, content string, tokens []llm.Logprob, counts *generatedTokenCounts, clock *PhaseClock) (calls []api.ToolCall, parsedContent string) {
+	if counts == nil {
+		return parser.Add(content)
 	}
+	if !generatedTokensMatch(content, tokens) {
+		counts.complete = false
+		return parser.Add(content)
+	}
+	if len(tokens) == 0 {
+		return parser.Add(content)
+	}
+	var contentBuilder strings.Builder
+	for _, token := range tokens {
+		before := parser.StateName()
+		parsedCalls, content := parser.Add(token.Token)
+		notePhaseClock(clock, parser)
+		counts.addToken(tokenPhase(before, parser.StateName()))
+		calls = append(calls, parsedCalls...)
+		contentBuilder.WriteString(content)
+	}
+	return calls, contentBuilder.String()
+}
 
-	counts.reasoning = evalCount * counts.reasoning / total
-	counts.toolCalls = evalCount * counts.toolCalls / total
-	counts.answer = evalCount - counts.reasoning - counts.toolCalls
-	return counts, nil
+func addAnswerTokens(content string, tokens []llm.Logprob, counts *generatedTokenCounts) {
+	if counts == nil {
+		return
+	}
+	if !generatedTokensMatch(content, tokens) {
+		counts.complete = false
+		return
+	}
+	for range tokens {
+		counts.addToken(phaseStateAnswer)
+	}
 }
 
 // splitDurations splits the total evaluation duration into the reasoning,
