@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"log/slog"
 	"strings"
+	"time"
 	"unicode"
 
 	"github.com/ollama/ollama/api"
@@ -20,6 +21,65 @@ type CohereParser struct {
 	state     cohereParserState
 	buffer    strings.Builder
 	callIndex int
+	// stateTransition holds the wall-clock time of the last parser state
+	// transition. The zero value means no transition has happened yet.
+	stateTransition time.Time
+	// thinkingTokens counts the bytes of thinking content attributed to the
+	// reasoning phase. It is used as the token-count proxy for [StateProvider].
+	thinkingTokens int
+	// toolCallTokens counts the bytes of tool-call content attributed to the
+	// tool-calling phase. It is used as the token-count proxy for
+	// [StateProvider].
+	toolCallTokens int
+	// answerTokens counts the bytes of answer content attributed to the
+	// answer phase. It is used as the token-count proxy for [StateProvider].
+	answerTokens int
+}
+
+// StateTransitionTime returns the wall-clock time at which the parser last
+// transitioned to a different state, or the zero time if no transition has
+// happened yet.
+func (p *CohereParser) StateTransitionTime() time.Time {
+	return p.stateTransition
+}
+
+// ThinkingTokens returns the number of thinking-content bytes attributed to
+// the reasoning phase, used as the token-count proxy for [StateProvider].
+func (p *CohereParser) ThinkingTokens() int { return p.thinkingTokens }
+
+// ToolCallTokens returns the number of tool-call-content bytes attributed to
+// the tool-calling phase, used as the token-count proxy for [StateProvider].
+func (p *CohereParser) ToolCallTokens() int { return p.toolCallTokens }
+
+// AnswerTokens returns the number of answer-content bytes attributed to the
+// answer phase, used as the token-count proxy for [StateProvider].
+func (p *CohereParser) AnswerTokens() int { return p.answerTokens }
+
+// StateName returns the normalized name of the parser's current state:
+// "thinking" while the thinking block is being collected, "thinkingDone"
+// while the next block (text or action) is awaited, "toolCalling" while the
+// action block is being collected and "answer" otherwise.
+func (p *CohereParser) StateName() string {
+	switch p.state {
+	case cohereCollectingThinking:
+		return phaseThinking
+	case cohereAwaitingBlock:
+		return phaseThinkingDone
+	case cohereCollectingAction:
+		return phaseToolCalling
+	default:
+		return phaseAnswer
+	}
+}
+
+// setState transitions the parser to next, recording the wall-clock time of
+// the transition. No time is recorded when the state does not change.
+func (p *CohereParser) setState(next cohereParserState) {
+	if p.state == next {
+		return
+	}
+	p.stateTransition = time.Now()
+	p.state = next
 }
 
 type cohereParserState int
@@ -73,6 +133,7 @@ func (p *CohereParser) PreservedTokens() []string {
 func (p *CohereParser) Init(tools []api.Tool, lastMessage *api.Message, thinkValue *api.ThinkValue) []api.Tool {
 	p.buffer.Reset()
 	p.callIndex = 0
+	p.stateTransition = time.Time{}
 
 	// The template enables reasoning by default; nil means default.
 	thinkingEnabled := thinkValue == nil || thinkValue.Bool()
@@ -97,6 +158,7 @@ func (p *CohereParser) Add(s string, done bool) (content string, thinking string
 	for {
 		c, t, tc, more := p.eat(done)
 		contentSb.WriteString(c)
+		p.answerTokens += len(c)
 		thinkingSb.WriteString(t)
 		calls = append(calls, tc...)
 		if !more {
@@ -126,7 +188,7 @@ func (p *CohereParser) eat(done bool) (content string, thinking string, calls []
 		if idx := strings.Index(buf, cohereEndThinking); idx != -1 {
 			thinking = strings.TrimRightFunc(buf[:idx], unicode.IsSpace)
 			p.resetBuffer(buf[idx+len(cohereEndThinking):])
-			p.state = cohereAwaitingBlock
+			p.setState(cohereAwaitingBlock)
 			return "", thinking, nil, true
 		}
 		// Emit all but a possible partial tag / trailing whitespace.
@@ -145,13 +207,13 @@ func (p *CohereParser) eat(done bool) (content string, thinking string, calls []
 		for _, open := range []string{cohereStartText, cohereStartResponse} {
 			if idx := strings.Index(buf, open); idx != -1 {
 				p.resetBuffer(buf[idx+len(open):])
-				p.state = cohereCollectingContent
+				p.setState(cohereCollectingContent)
 				return "", "", nil, true
 			}
 		}
 		if idx := strings.Index(buf, cohereStartAction); idx != -1 {
 			p.resetBuffer(buf[idx+len(cohereStartAction):])
-			p.state = cohereCollectingAction
+			p.setState(cohereCollectingAction)
 			return "", "", nil, true
 		}
 		trimmed := strings.TrimLeftFunc(buf, unicode.IsSpace)
@@ -172,7 +234,7 @@ func (p *CohereParser) eat(done bool) (content string, thinking string, calls []
 			return "", "", nil, false
 		}
 		p.buffer.Reset()
-		p.state = cohereCollectingContent
+		p.setState(cohereCollectingContent)
 		p.buffer.WriteString(trimmed)
 		return "", "", nil, true
 
@@ -182,7 +244,7 @@ func (p *CohereParser) eat(done bool) (content string, thinking string, calls []
 			if idx := strings.Index(buf, close); idx != -1 {
 				content = buf[:idx]
 				p.resetBuffer(buf[idx+len(close):])
-				p.state = cohereAwaitingBlock
+				p.setState(cohereAwaitingBlock)
 				return content, "", nil, true
 			}
 		}
@@ -202,7 +264,7 @@ func (p *CohereParser) eat(done bool) (content string, thinking string, calls []
 		if idx := strings.Index(buf, cohereEndAction); idx != -1 {
 			payload := buf[:idx]
 			p.resetBuffer(buf[idx+len(cohereEndAction):])
-			p.state = cohereAwaitingBlock
+			p.setState(cohereAwaitingBlock)
 			calls = parseCohereActions(payload)
 			return "", "", calls, true
 		}

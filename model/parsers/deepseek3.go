@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"strings"
+	"time"
 	"unicode"
 
 	"github.com/ollama/ollama/api"
@@ -35,6 +36,19 @@ type DeepSeek3Parser struct {
 	buffer             strings.Builder
 	callIndex          int
 	hasThinkingSupport bool
+	// stateTransition holds the wall-clock time of the last parser state
+	// transition. The zero value means no transition has happened yet.
+	stateTransition time.Time
+	// thinkingTokens counts the bytes of thinking content attributed to the
+	// reasoning phase. It is used as the token-count proxy for [StateProvider].
+	thinkingTokens int
+	// toolCallTokens counts the bytes of tool-call content attributed to the
+	// tool-calling phase. It is used as the token-count proxy for
+	// [StateProvider].
+	toolCallTokens int
+	// answerTokens counts the bytes of answer content attributed to the
+	// answer phase. It is used as the token-count proxy for [StateProvider].
+	answerTokens int
 }
 
 func (p *DeepSeek3Parser) HasToolSupport() bool {
@@ -44,6 +58,49 @@ func (p *DeepSeek3Parser) HasToolSupport() bool {
 func (p *DeepSeek3Parser) HasThinkingSupport() bool {
 	return p.hasThinkingSupport
 }
+
+// StateTransitionTime returns the wall-clock time at which the parser last
+// transitioned to a different state, or the zero time if no transition has
+// happened yet.
+func (p *DeepSeek3Parser) StateTransitionTime() time.Time {
+	return p.stateTransition
+}
+
+// StateName returns the normalized name of the parser's current state:
+// "thinking" while the thinking block is being collected, "toolCalling" in
+// the tool-call/tool-output region and "answer" otherwise.
+func (p *DeepSeek3Parser) StateName() string {
+	switch p.state {
+	case DeepSeekCollectingThinking:
+		return phaseThinking
+	case DeepSeekCollectingToolCalls, DeepSeekCollectingToolOutput:
+		return phaseToolCalling
+	default:
+		return phaseAnswer
+	}
+}
+
+// setState transitions the parser to next, recording the wall-clock time of
+// the transition. No time is recorded when the state does not change.
+func (p *DeepSeek3Parser) setState(next DeepSeek3ParserState) {
+	if p.state == next {
+		return
+	}
+	p.stateTransition = time.Now()
+	p.state = next
+}
+
+// ThinkingTokens returns the number of thinking-content bytes attributed to
+// the reasoning phase, used as the token-count proxy for [StateProvider].
+func (p *DeepSeek3Parser) ThinkingTokens() int { return p.thinkingTokens }
+
+// ToolCallTokens returns the number of tool-call-content bytes attributed to
+// the tool-calling phase, used as the token-count proxy for [StateProvider].
+func (p *DeepSeek3Parser) ToolCallTokens() int { return p.toolCallTokens }
+
+// AnswerTokens returns the number of answer-content bytes attributed to the
+// answer phase, used as the token-count proxy for [StateProvider].
+func (p *DeepSeek3Parser) AnswerTokens() int { return p.answerTokens }
 
 func (p *DeepSeek3Parser) ThinkingClose() []string {
 	if p.state == DeepSeekCollectingThinking {
@@ -72,20 +129,25 @@ func (p *DeepSeek3Parser) setInitialState(lastMessage *api.Message, tools []api.
 	thinkingEnabled := p.HasThinkingSupport() && (thinkValue != nil && thinkValue.Bool())
 
 	if !thinkingEnabled {
-		p.state = DeepSeekCollectingContent
+		p.setState(DeepSeekCollectingContent)
 		return
 	}
 
 	if prefill && lastMessage.Content != "" {
-		p.state = DeepSeekCollectingContent
+		p.setState(DeepSeekCollectingContent)
 		return
 	}
 
-	p.state = DeepSeekCollectingThinking
+	p.setState(DeepSeekCollectingThinking)
 }
 
 func (p *DeepSeek3Parser) Init(tools []api.Tool, lastMessage *api.Message, thinkValue *api.ThinkValue) []api.Tool {
 	p.callIndex = 0
+	p.stateTransition = time.Time{}
+	p.thinkingTokens = 0
+	p.toolCallTokens = 0
+	p.answerTokens = 0
+	p.answerTokens = 0
 	p.setInitialState(lastMessage, tools, thinkValue)
 	return tools
 }
@@ -123,8 +185,10 @@ func (p *DeepSeek3Parser) Add(s string, done bool) (content string, thinking str
 			toolCalls = append(toolCalls, event.toolCall)
 		case deepseekEventThinkingContent:
 			thinkingSb.WriteString(event.content)
+			p.thinkingTokens += len(event.content)
 		case deepseekEventContent:
 			contentSb.WriteString(event.content)
+			p.answerTokens += len(event.content)
 		}
 	}
 
@@ -170,7 +234,7 @@ func (p *DeepSeek3Parser) eat() ([]deepseekEvent, bool) {
 
 			p.buffer.Reset()
 			p.buffer.WriteString(remaining)
-			p.state = DeepSeekCollectingContent
+			p.setState(DeepSeekCollectingContent)
 
 			if len(thinking) > 0 {
 				events = append(events, deepseekEventThinkingContent{content: thinking})
@@ -212,7 +276,7 @@ func (p *DeepSeek3Parser) eat() ([]deepseekEvent, bool) {
 
 			p.buffer.Reset()
 			p.buffer.WriteString(remaining)
-			p.state = DeepSeekCollectingToolCalls
+			p.setState(DeepSeekCollectingToolCalls)
 
 			if len(contentBefore) > 0 {
 				events = append(events, deepseekEventContent{content: contentBefore})
@@ -225,7 +289,7 @@ func (p *DeepSeek3Parser) eat() ([]deepseekEvent, bool) {
 
 			p.buffer.Reset()
 			p.buffer.WriteString(remaining)
-			p.state = DeepSeekCollectingToolOutput
+			p.setState(DeepSeekCollectingToolOutput)
 
 			if len(contentBefore) > 0 {
 				events = append(events, deepseekEventContent{content: contentBefore})
@@ -266,7 +330,7 @@ func (p *DeepSeek3Parser) eat() ([]deepseekEvent, bool) {
 
 			p.buffer.Reset()
 			p.buffer.WriteString(remaining)
-			p.state = DeepSeekCollectingContent
+			p.setState(DeepSeekCollectingContent)
 
 			return events, true
 		}
@@ -281,7 +345,7 @@ func (p *DeepSeek3Parser) eat() ([]deepseekEvent, bool) {
 
 			p.buffer.Reset()
 			p.buffer.WriteString(remaining)
-			p.state = DeepSeekCollectingContent
+			p.setState(DeepSeekCollectingContent)
 
 			if len(toolOutputContent) > 0 {
 				events = append(events, deepseekEventContent{content: toolOutputContent})

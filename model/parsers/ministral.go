@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 	"unicode"
 
 	"github.com/ollama/ollama/api"
@@ -47,6 +48,62 @@ type MinistralParser struct {
 	callIndex          int
 	hasThinkingSupport bool
 	pendingToolName    string // stores tool name while collecting args
+	// stateTransition holds the wall-clock time of the last parser state
+	// transition. The zero value means no transition has happened yet.
+	stateTransition time.Time
+	// thinkingTokens counts the bytes of thinking content attributed to the
+	// reasoning phase. It is used as the token-count proxy for [StateProvider].
+	thinkingTokens int
+	// toolCallTokens counts the bytes of tool-call content attributed to the
+	// tool-calling phase. It is used as the token-count proxy for
+	// [StateProvider].
+	toolCallTokens int
+	// answerTokens counts the bytes of answer content attributed to the
+	// answer phase. It is used as the token-count proxy for [StateProvider].
+	answerTokens int
+}
+
+// StateTransitionTime returns the wall-clock time at which the parser last
+// transitioned to a different state, or the zero time if no transition has
+// happened yet.
+func (p *MinistralParser) StateTransitionTime() time.Time {
+	return p.stateTransition
+}
+
+// ThinkingTokens returns the number of thinking-content bytes attributed to
+// the reasoning phase, used as the token-count proxy for [StateProvider].
+func (p *MinistralParser) ThinkingTokens() int { return p.thinkingTokens }
+
+// ToolCallTokens returns the number of tool-call-content bytes attributed to
+// the tool-calling phase, used as the token-count proxy for [StateProvider].
+func (p *MinistralParser) ToolCallTokens() int { return p.toolCallTokens }
+
+// AnswerTokens returns the number of answer-content bytes attributed to the
+// answer phase, used as the token-count proxy for [StateProvider].
+func (p *MinistralParser) AnswerTokens() int { return p.answerTokens }
+
+// StateName returns the normalized name of the parser's current state:
+// "thinking" while the thinking block is being collected, "toolCalling"
+// while a tool name/args are being collected and "answer" otherwise.
+func (p *MinistralParser) StateName() string {
+	switch p.state {
+	case ministralCollectingThinkingContent:
+		return phaseThinking
+	case ministralCollectingToolName, ministralCollectingToolArgs:
+		return phaseToolCalling
+	default:
+		return phaseAnswer
+	}
+}
+
+// setState transitions the parser to next, recording the wall-clock time of
+// the transition. No time is recorded when the state does not change.
+func (p *MinistralParser) setState(next ministralParserState) {
+	if p.state == next {
+		return
+	}
+	p.stateTransition = time.Now()
+	p.state = next
 }
 
 func (p *MinistralParser) HasToolSupport() bool {
@@ -91,6 +148,7 @@ func (p *MinistralParser) setInitialState(lastMessage *api.Message) {
 func (p *MinistralParser) Init(tools []api.Tool, lastMessage *api.Message, thinkValue *api.ThinkValue) []api.Tool {
 	p.tools = tools
 	p.callIndex = 0
+	p.stateTransition = time.Time{}
 	p.setInitialState(lastMessage)
 	return tools
 }
@@ -132,7 +190,7 @@ func (p *MinistralParser) eat() ([]ministralEvent, bool) {
 			after := split[1]
 			p.buffer.Reset()
 			p.buffer.WriteString(after)
-			p.state = ministralCollectingToolName
+			p.setState(ministralCollectingToolName)
 			return events, true
 		}
 
@@ -146,7 +204,7 @@ func (p *MinistralParser) eat() ([]ministralEvent, bool) {
 			after := split[1]
 			p.buffer.Reset()
 			p.buffer.WriteString(after)
-			p.state = ministralCollectingThinkingContent
+			p.setState(ministralCollectingThinkingContent)
 			return events, true
 		}
 
@@ -194,7 +252,7 @@ func (p *MinistralParser) eat() ([]ministralEvent, bool) {
 			if len(thinkingContent) > 0 {
 				events = append(events, ministralEventThinking{thinking: thinkingContent})
 			}
-			p.state = ministralCollectingContent
+			p.setState(ministralCollectingContent)
 			return events, true
 		}
 
@@ -227,7 +285,7 @@ func (p *MinistralParser) eat() ([]ministralEvent, bool) {
 			p.pendingToolName = toolName
 			p.buffer.Reset()
 			p.buffer.WriteString(after)
-			p.state = ministralCollectingToolArgs
+			p.setState(ministralCollectingToolArgs)
 			return events, true
 		}
 		// Wait for more data
@@ -249,7 +307,7 @@ func (p *MinistralParser) eat() ([]ministralEvent, bool) {
 			p.pendingToolName = ""
 			p.buffer.Reset()
 			p.buffer.WriteString(remaining)
-			p.state = ministralCollectingContent
+			p.setState(ministralCollectingContent)
 			return events, true
 		}
 		// Wait for more data
@@ -284,6 +342,7 @@ func (p *MinistralParser) Add(s string, done bool) (content string, thinking str
 		switch e := event.(type) {
 		case ministralEventContent:
 			contentBuilder.WriteString(e.content)
+			p.answerTokens += len(e.content)
 		case ministralEventThinking:
 			thinkingBuilder.WriteString(e.thinking)
 		case ministralEventToolCall:

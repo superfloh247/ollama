@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/ollama/ollama/api"
 )
@@ -26,6 +27,58 @@ type FunctionGemmaParser struct {
 	buffer    strings.Builder
 	tools     []api.Tool
 	callIndex int
+	// stateTransition holds the wall-clock time of the last parser state
+	// transition. The zero value means no transition has happened yet.
+	stateTransition time.Time
+	// thinkingTokens counts the bytes of thinking content attributed to the
+	// reasoning phase. It is used as the token-count proxy for [StateProvider].
+	thinkingTokens int
+	// toolCallTokens counts the bytes of tool-call content attributed to the
+	// tool-calling phase. It is used as the token-count proxy for
+	// [StateProvider].
+	toolCallTokens int
+	// answerTokens counts the bytes of answer content attributed to the
+	// answer phase. It is used as the token-count proxy for [StateProvider].
+	answerTokens int
+}
+
+// StateTransitionTime returns the wall-clock time at which the parser last
+// transitioned to a different state, or the zero time if no transition has
+// happened yet.
+func (p *FunctionGemmaParser) StateTransitionTime() time.Time {
+	return p.stateTransition
+}
+
+// ThinkingTokens returns the number of thinking-content bytes attributed to
+// the reasoning phase, used as the token-count proxy for [StateProvider].
+func (p *FunctionGemmaParser) ThinkingTokens() int { return p.thinkingTokens }
+
+// ToolCallTokens returns the number of tool-call-content bytes attributed to
+// the tool-calling phase, used as the token-count proxy for [StateProvider].
+func (p *FunctionGemmaParser) ToolCallTokens() int { return p.toolCallTokens }
+
+// AnswerTokens returns the number of answer-content bytes attributed to the
+// answer phase, used as the token-count proxy for [StateProvider].
+func (p *FunctionGemmaParser) AnswerTokens() int { return p.answerTokens }
+
+// StateName returns the normalized name of the parser's current state:
+// "toolCalling" while function calls are being collected and "answer"
+// otherwise.
+func (p *FunctionGemmaParser) StateName() string {
+	if p.state == FunctionGemmaCollectingToolCalls {
+		return phaseToolCalling
+	}
+	return phaseAnswer
+}
+
+// setState transitions the parser to next, recording the wall-clock time of
+// the transition. No time is recorded when the state does not change.
+func (p *FunctionGemmaParser) setState(next FunctionGemmaParserState) {
+	if p.state == next {
+		return
+	}
+	p.stateTransition = time.Now()
+	p.state = next
 }
 
 func (p *FunctionGemmaParser) HasToolSupport() bool     { return true }
@@ -41,6 +94,7 @@ func (p *FunctionGemmaParser) PreservedTokens() []string {
 
 func (p *FunctionGemmaParser) Init(tools []api.Tool, lastMessage *api.Message, thinkValue *api.ThinkValue) []api.Tool {
 	p.tools = tools
+	p.stateTransition = time.Time{}
 	p.state = FunctionGemmaCollectingContent
 	p.callIndex = 0
 	return tools
@@ -73,6 +127,7 @@ func (p *FunctionGemmaParser) Add(s string, done bool) (content string, thinking
 			toolCalls = append(toolCalls, event.toolCall)
 		case FunctionGemmaEventContent:
 			contentSb.WriteString(event.content)
+			p.answerTokens += len(event.content)
 		}
 	}
 
@@ -121,7 +176,7 @@ func (p *FunctionGemmaParser) eat() ([]functionGemmaEvent, bool) {
 			content := split[0]
 			p.buffer.Reset()
 			p.buffer.WriteString(split[1])
-			p.state = FunctionGemmaCollectingToolCalls
+			p.setState(FunctionGemmaCollectingToolCalls)
 			if content != "" {
 				return []functionGemmaEvent{FunctionGemmaEventContent{content: content}}, true
 			}
@@ -148,7 +203,7 @@ func (p *FunctionGemmaParser) eat() ([]functionGemmaEvent, bool) {
 			}
 
 			if !strings.Contains(remaining, functionGemmaFunctionCallOpen) {
-				p.state = FunctionGemmaCollectingContent
+				p.setState(FunctionGemmaCollectingContent)
 			}
 			return events, true
 		}

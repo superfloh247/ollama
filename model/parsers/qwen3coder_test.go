@@ -387,6 +387,17 @@ func TestQwenToolParser(t *testing.T) {
 
 	steps := []step{
 		{
+			name: "literal function close in string parameter",
+			tools: []api.Tool{tool("write", map[string]api.ToolProperty{
+				"content": {Type: api.PropertyType{"string"}},
+			})},
+			rawToolCall: `<function=write><parameter=content>text = "</function>"</parameter></function>`,
+			wantToolCall: api.ToolCall{Function: api.ToolCallFunction{
+				Name:      "write",
+				Arguments: testArgs(map[string]any{"content": `text = "</function>"`}),
+			}},
+		},
+		{
 			name:  "simple tool call",
 			tools: []api.Tool{},
 			rawToolCall: `<function=get_current_temperature>
@@ -1113,25 +1124,30 @@ func TestQwen3CoderParserDoneFlushesBufferedContent(t *testing.T) {
 
 func TestQwen3CoderParserToolCallIndexingStreaming(t *testing.T) {
 	parser := Qwen3CoderParser{}
-	parser.Init(nil, nil, nil)
+	parser.Init([]api.Tool{tool("write", map[string]api.ToolProperty{
+		"content": {Type: api.PropertyType{"string"}},
+	})}, nil, nil)
 
 	var all []api.ToolCall
 
-	_, _, calls, err := parser.Add("<tool_call><function=first><parameter=a>1</parameter></function></tool_call><tool_call><function=second>", false)
+	content, _, calls, err := parser.Add(`Before<tool_call><function=first><parameter=a>1</parameter></function></tool_call>Between<tool_call><function=write><parameter=content>text = "</fun`, false)
 	if err != nil {
 		t.Fatalf("step 1 parse failed: %v", err)
 	}
 	all = append(all, calls...)
 
-	_, _, calls, err = parser.Add("<parameter=b>2</parameter></function></tool_call><tool_call><function=third><parameter=c>3</parameter></function></tool_call>", true)
+	c, _, calls, err := parser.Add(`ction>"</parameter></function></tool_call>After<tool_call><function=third><parameter=c>3</parameter></function></tool_call>`, true)
 	if err != nil {
 		t.Fatalf("step 2 parse failed: %v", err)
 	}
 	all = append(all, calls...)
+	if content+c != "BeforeBetweenAfter" {
+		t.Fatalf("unexpected content: %q", content+c)
+	}
 
 	want := []api.ToolCall{
 		{Function: api.ToolCallFunction{Name: "first", Arguments: testArgs(map[string]any{"a": "1"}), Index: 0}},
-		{Function: api.ToolCallFunction{Name: "second", Arguments: testArgs(map[string]any{"b": "2"}), Index: 1}},
+		{Function: api.ToolCallFunction{Name: "write", Arguments: testArgs(map[string]any{"content": `text = "</function>"`}), Index: 1}},
 		{Function: api.ToolCallFunction{Name: "third", Arguments: testArgs(map[string]any{"c": "3"}), Index: 2}},
 	}
 	if len(all) != len(want) {
@@ -1167,6 +1183,28 @@ func TestQwen3CoderParserToolCallIndexResetOnInit(t *testing.T) {
 	}
 	if !toolCallEqual(calls[0], want) {
 		t.Fatalf("got %#v, want %#v", calls[0], want)
+	}
+}
+
+func TestQwen3CoderParserRejectsMalformedParameters(t *testing.T) {
+	for _, raw := range []string{
+		`<function=write><parameter=content>print('ok')</function>`,
+		`<function=write><parameter=content>print('ok')</parameter=content></function>`,
+		`<function=write><parameter=content>text = "</function>"</parameter>`,
+		// Reduced shape from #18563's follow-up: the outer edits parameter is unclosed.
+		`<function=edit>
+<parameter=path>src/orders.py</parameter>
+<parameter=edits>
+<parameter=oldText>before</parameter>
+<parameter=newText>after</parameter>
+</function>`,
+	} {
+		parser := Qwen3CoderParser{}
+		parser.Init(nil, nil, nil)
+		_, _, calls, err := parser.Add(toolOpenTag+raw+toolCloseTag, true)
+		if err == nil || len(calls) != 0 {
+			t.Errorf("raw=%q: expected rejection without tool calls, got calls=%#v, err=%v", raw, calls, err)
+		}
 	}
 }
 
@@ -1287,5 +1325,50 @@ func TestOverlapFunction(t *testing.T) {
 				t.Errorf("overlap(%q, %q) = %d, want %d", tc.s, tc.delim, got, tc.want)
 			}
 		})
+	}
+}
+
+func TestQwen3CoderParserStateTransitionTime(t *testing.T) {
+	// note: tags are built from parts to avoid literal tool tags in this file
+	const (
+		toolOpen  = "<" + "tool_call>"
+		toolClose = "</" + "tool_call>"
+	)
+
+	p := &Qwen3CoderParser{}
+	p.Init(nil, nil, nil)
+
+	if !p.StateTransitionTime().IsZero() {
+		t.Fatalf("expected zero StateTransitionTime before any transition, got %v", p.StateTransitionTime())
+	}
+
+	// plain content without any tool call must not record a transition
+	content, _, calls, err := p.Add("no tool calls here", true)
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+	if content != "no tool calls here" {
+		t.Fatalf("expected content %q, got %q", "no tool calls here", content)
+	}
+	if len(calls) != 0 {
+		t.Fatalf("expected no tool calls, got %d", len(calls))
+	}
+	if !p.StateTransitionTime().IsZero() {
+		t.Fatalf("expected zero StateTransitionTime without any tool calls, got %v", p.StateTransitionTime())
+	}
+
+	// a tool call transitions the parser into and out of tool-call collection
+	content, _, calls, err = p.Add(toolOpen+"<function=get_weather><parameter=location>San Francisco</parameter></function>"+toolClose+"done", true)
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+	if content != "done" {
+		t.Fatalf("expected content %q, got %q", "done", content)
+	}
+	if len(calls) != 1 {
+		t.Fatalf("expected 1 tool call, got %d", len(calls))
+	}
+	if p.StateTransitionTime().IsZero() {
+		t.Fatal("expected non-zero StateTransitionTime after a tool call")
 	}
 }

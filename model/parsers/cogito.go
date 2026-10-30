@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"strings"
+	"time"
 	"unicode"
 
 	"github.com/ollama/ollama/api"
@@ -36,6 +37,62 @@ type CogitoParser struct {
 	state     CogitoParserState
 	buffer    strings.Builder
 	callIndex int
+	// stateTransition holds the wall-clock time of the last parser state
+	// transition. The zero value means no transition has happened yet.
+	stateTransition time.Time
+	// thinkingTokens counts the bytes of thinking content attributed to the
+	// reasoning phase. It is used as the token-count proxy for [StateProvider].
+	thinkingTokens int
+	// toolCallTokens counts the bytes of tool-call content attributed to the
+	// tool-calling phase. It is used as the token-count proxy for
+	// [StateProvider].
+	toolCallTokens int
+	// answerTokens counts the bytes of answer content attributed to the
+	// answer phase. It is used as the token-count proxy for [StateProvider].
+	answerTokens int
+}
+
+// StateTransitionTime returns the wall-clock time at which the parser last
+// transitioned to a different state, or the zero time if no transition has
+// happened yet.
+func (p *CogitoParser) StateTransitionTime() time.Time {
+	return p.stateTransition
+}
+
+// ThinkingTokens returns the number of thinking-content bytes attributed to
+// the reasoning phase, used as the token-count proxy for [StateProvider].
+func (p *CogitoParser) ThinkingTokens() int { return p.thinkingTokens }
+
+// ToolCallTokens returns the number of tool-call-content bytes attributed to
+// the tool-calling phase, used as the token-count proxy for [StateProvider].
+func (p *CogitoParser) ToolCallTokens() int { return p.toolCallTokens }
+
+// AnswerTokens returns the number of answer-content bytes attributed to the
+// answer phase, used as the token-count proxy for [StateProvider].
+func (p *CogitoParser) AnswerTokens() int { return p.answerTokens }
+
+// StateName returns the normalized name of the parser's current state:
+// "thinking" while the thinking block is being collected, "toolCalling" in
+// the tool-call/tool-output region and "answer" otherwise.
+func (p *CogitoParser) StateName() string {
+	switch p.state {
+	case CogitoCollectingThinking:
+		return phaseThinking
+	case CogitoCollectingToolCalls, CogitoCollectingToolOutput:
+		return phaseToolCalling
+	default:
+		return phaseAnswer
+	}
+}
+
+// setState transitions the parser to next, recording the wall-clock time of
+// the transition. No time is recorded when the state does not change.
+func (p *CogitoParser) setState(next CogitoParserState) {
+	if p.state == next {
+		return
+	}
+	p.stateTransition = time.Now()
+	p.state = next
 }
 
 func (p *CogitoParser) HasToolSupport() bool {
@@ -96,6 +153,7 @@ func (p *CogitoParser) setInitialState(lastMessage *api.Message, tools []api.Too
 
 func (p *CogitoParser) Init(tools []api.Tool, lastMessage *api.Message, thinkValue *api.ThinkValue) []api.Tool {
 	p.callIndex = 0
+	p.stateTransition = time.Time{}
 	p.setInitialState(lastMessage, tools, thinkValue)
 	return tools
 }
@@ -133,8 +191,10 @@ func (p *CogitoParser) Add(s string, done bool) (content string, thinking string
 			toolCalls = append(toolCalls, event.toolCall)
 		case cogitoEventThinkingContent:
 			thinkingSb.WriteString(event.content)
+			p.thinkingTokens += len(event.content)
 		case cogitoEventContent:
 			contentSb.WriteString(event.content)
+			p.answerTokens += len(event.content)
 		}
 	}
 
@@ -180,7 +240,7 @@ func (p *CogitoParser) eat() ([]cogitoEvent, bool) {
 
 			p.buffer.Reset()
 			p.buffer.WriteString(remaining)
-			p.state = CogitoCollectingContent
+			p.setState(CogitoCollectingContent)
 
 			if len(thinking) > 0 {
 				events = append(events, cogitoEventThinkingContent{content: thinking})
@@ -222,7 +282,7 @@ func (p *CogitoParser) eat() ([]cogitoEvent, bool) {
 
 			p.buffer.Reset()
 			p.buffer.WriteString(remaining)
-			p.state = CogitoCollectingToolCalls
+			p.setState(CogitoCollectingToolCalls)
 
 			if len(contentBefore) > 0 {
 				events = append(events, cogitoEventContent{content: contentBefore})
@@ -235,7 +295,7 @@ func (p *CogitoParser) eat() ([]cogitoEvent, bool) {
 
 			p.buffer.Reset()
 			p.buffer.WriteString(remaining)
-			p.state = CogitoCollectingToolOutput
+			p.setState(CogitoCollectingToolOutput)
 
 			if len(contentBefore) > 0 {
 				events = append(events, cogitoEventContent{content: contentBefore})
@@ -275,7 +335,7 @@ func (p *CogitoParser) eat() ([]cogitoEvent, bool) {
 
 			p.buffer.Reset()
 			p.buffer.WriteString(remaining)
-			p.state = CogitoCollectingContent
+			p.setState(CogitoCollectingContent)
 
 			return events, true
 		}
@@ -302,7 +362,7 @@ func (p *CogitoParser) eat() ([]cogitoEvent, bool) {
 
 			p.buffer.Reset()
 			p.buffer.WriteString(remaining)
-			p.state = CogitoCollectingContent
+			p.setState(CogitoCollectingContent)
 
 			return events, true
 		}

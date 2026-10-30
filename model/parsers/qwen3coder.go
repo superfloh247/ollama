@@ -10,6 +10,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 	"unicode"
 
 	"github.com/ollama/ollama/api"
@@ -33,6 +34,59 @@ type Qwen3CoderParser struct {
 	acc       strings.Builder
 	tools     []api.Tool
 	callIndex int
+	// stateTransition holds the wall-clock time of the last parser state
+	// transition. The zero value means no transition has happened yet.
+	stateTransition time.Time
+	// thinkingTokens counts the bytes of thinking content attributed to the
+	// reasoning phase. Qwen3Coder has no thinking support, so this stays 0.
+	// It is used as the token-count proxy for [StateProvider].
+	thinkingTokens int
+	// toolCallTokens counts the bytes of tool-call content attributed to the
+	// tool-calling phase. It is used as the token-count proxy for
+	// [StateProvider].
+	toolCallTokens int
+	// answerTokens
+	answerTokens int
+	// answerTokens counts the bytes of answer content attributed to the
+	// answer phase. It is used as the token-count proxy for [StateProvider].
+}
+
+// StateTransitionTime returns the wall-clock time at which the parser last
+// transitioned to a different state, or the zero time if no transition has
+// happened yet.
+func (p *Qwen3CoderParser) StateTransitionTime() time.Time {
+	return p.stateTransition
+}
+
+// ThinkingTokens returns the number of thinking-content bytes attributed to
+// the reasoning phase, used as the token-count proxy for [StateProvider].
+func (p *Qwen3CoderParser) ThinkingTokens() int { return p.thinkingTokens }
+
+// ToolCallTokens returns the number of tool-call-content bytes attributed to
+// the tool-calling phase, used as the token-count proxy for [StateProvider].
+func (p *Qwen3CoderParser) ToolCallTokens() int { return p.toolCallTokens }
+
+// AnswerTokens returns the number of answer-content bytes attributed to the
+// answer phase, used as the token-count proxy for [StateProvider].
+func (p *Qwen3CoderParser) AnswerTokens() int { return p.answerTokens }
+
+// StateName returns the normalized name of the parser's current state:
+// "toolCalling" while tool-call content is being collected and "answer"
+// otherwise.
+func (p *Qwen3CoderParser) StateName() string {
+	if p.state == qwenParserState_CollectingToolContent {
+		return phaseToolCalling
+	}
+	return phaseAnswer
+}
+
+// ThinkingTokens returns the number of thinking-content bytes attributed to
+func (p *Qwen3CoderParser) setState(next qwenParserState) {
+	if p.state == next {
+		return
+	}
+	p.stateTransition = time.Now()
+	p.state = next
 }
 
 func (p *Qwen3CoderParser) HasToolSupport() bool {
@@ -57,6 +111,10 @@ func (p *Qwen3CoderParser) PreservedTokens() []string {
 func (p *Qwen3CoderParser) Init(tools []api.Tool, lastMessage *api.Message, thinkValue *api.ThinkValue) []api.Tool {
 	p.tools = tools
 	p.callIndex = 0
+	p.thinkingTokens = 0
+	p.toolCallTokens = 0
+	p.answerTokens = 0
+	p.answerTokens = 0
 	return tools // Qwen doesn't modify tools
 }
 
@@ -74,7 +132,7 @@ func (p *Qwen3CoderParser) Add(s string, done bool) (content string, thinking st
 			events = append(events, qwenEventContent{content: toolOpenTag + p.acc.String()})
 		}
 		p.acc.Reset()
-		p.state = qwenParserState_LookingForToolStart
+		p.setState(qwenParserState_LookingForToolStart)
 	}
 
 	var toolCalls []api.ToolCall
@@ -82,6 +140,7 @@ func (p *Qwen3CoderParser) Add(s string, done bool) (content string, thinking st
 	for _, event := range events {
 		switch event := event.(type) {
 		case qwenEventRawToolCall:
+			p.toolCallTokens += len(event.raw)
 			toolCall, err := parseToolCall(event, p.tools)
 			if err != nil {
 				slog.Warn("qwen tool call parsing failed", "error", err)
@@ -95,6 +154,7 @@ func (p *Qwen3CoderParser) Add(s string, done bool) (content string, thinking st
 			// events, we naively append them together here. See the note below about
 			// `qwenEvent`s for more details
 			sb.WriteString(event.content)
+			p.answerTokens += len(event.content)
 		}
 	}
 
@@ -163,7 +223,7 @@ func eat(p *Qwen3CoderParser) ([]qwenEvent, bool) {
 			after := split[1]
 			p.acc.Reset()
 			p.acc.WriteString(after)
-			p.state = qwenParserState_CollectingToolContent
+			p.setState(qwenParserState_CollectingToolContent)
 			return events, true
 		} else if overlap := overlap(p.acc.String(), toolOpenTag); overlap > 0 {
 			// we found a partial tool open tag, so we can emit the unambiguous part,
@@ -206,7 +266,7 @@ func eat(p *Qwen3CoderParser) ([]qwenEvent, bool) {
 			p.acc.Reset()
 			p.acc.WriteString(after)
 			events = append(events, qwenEventRawToolCall{raw: before})
-			p.state = qwenParserState_LookingForToolStart
+			p.setState(qwenParserState_LookingForToolStart)
 			return events, true
 		} else {
 			// note that we don't need to check the overlap here because we only plan
@@ -439,11 +499,25 @@ func transformToXML(raw string) string {
 	// xml tags we just emitted
 	var out strings.Builder
 	lastIdx := 0
+	parameterDepth := 0
 	for _, loc := range qwenXMLTagRegex.FindAllStringIndex(transformed, -1) {
 		if loc[0] > lastIdx {
 			escapeTextNode(&out, transformed[lastIdx:loc[0]])
 		}
-		out.WriteString(transformed[loc[0]:loc[1]])
+		tag := transformed[loc[0]:loc[1]]
+		switch {
+		case strings.HasPrefix(tag, "<parameter"):
+			parameterDepth++
+		case tag == "</parameter>" && parameterDepth > 0:
+			parameterDepth--
+		}
+		// Only a function-level close ends the call. A parameter can contain
+		// this literal text, but still needs its own closing tag.
+		if tag == "</function>" && parameterDepth > 0 {
+			escapeTextNode(&out, tag)
+		} else {
+			out.WriteString(tag)
+		}
 		lastIdx = loc[1]
 	}
 	if lastIdx < len(transformed) {

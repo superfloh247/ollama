@@ -313,6 +313,44 @@ func TestVar(t *testing.T) {
 	}
 }
 
+func TestLogMetrics(t *testing.T) {
+	cases := map[string]bool{
+		"":      false,
+		"false": false,
+		"0":     false,
+		"true":  true,
+		"1":     true,
+		"t":     true,
+	}
+
+	for k, v := range cases {
+		t.Run(k, func(t *testing.T) {
+			t.Setenv("OLLAMA_LOG_METRICS", k)
+			if got := LogMetrics(); got != v {
+				t.Errorf("%q: expected %v, got %v", k, v, got)
+			}
+		})
+	}
+}
+
+func TestMetricsLogFile(t *testing.T) {
+	cases := map[string]string{
+		"":                   "",
+		"/tmp/custom.log":    "/tmp/custom.log",
+		"/home/user/metrics": "/home/user/metrics",
+		"  /tmp/with_space ": "/tmp/with_space",
+	}
+
+	for k, v := range cases {
+		t.Run(k, func(t *testing.T) {
+			t.Setenv("OLLAMA_METRICS_LOG_FILE", k)
+			if got := MetricsLogFile(); got != v {
+				t.Errorf("%q: expected %q, got %q", k, v, got)
+			}
+		})
+	}
+}
+
 func TestContextLength(t *testing.T) {
 	cases := map[string]uint{
 		"":     0,

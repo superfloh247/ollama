@@ -5,11 +5,19 @@ import (
 	"encoding/json"
 	"strings"
 	"text/template"
+	"time"
 
 	"github.com/ollama/ollama/api"
 )
 
 type toolsState int
+
+// Normalized phase names exposed via [Parser.StateName]; they must match the
+// phase vocabulary of the server package's PhaseClock.
+const (
+	phaseToolCalling = "toolCalling"
+	phaseAnswer      = "answer"
+)
 
 const (
 	toolsState_LookingForTag toolsState = iota
@@ -24,6 +32,36 @@ type Parser struct {
 	state  toolsState
 	buffer []byte
 	n      int
+	// stateTransition holds the wall-clock time of the last parser state
+	// transition. The zero value means no transition has happened yet.
+	stateTransition time.Time
+}
+
+// StateTransitionTime returns the wall-clock time at which the parser last
+// transitioned to a different state, or the zero time if no transition has
+// happened yet.
+func (p *Parser) StateTransitionTime() time.Time {
+	return p.stateTransition
+}
+
+// StateName returns the normalized name of the parser's current state:
+// "toolCalling" while a tool call is being collected and "answer" otherwise
+// (before the tool-call tag and after it has been drained).
+func (p *Parser) StateName() string {
+	if p.state == toolsState_ToolCalling {
+		return phaseToolCalling
+	}
+	return phaseAnswer
+}
+
+// setState transitions the parser to next, recording the wall-clock time of
+// the transition. No time is recorded when the state does not change.
+func (p *Parser) setState(next toolsState) {
+	if p.state == next {
+		return
+	}
+	p.stateTransition = time.Now()
+	p.state = next
 }
 
 func (p *Parser) GetBuffer() []byte {
@@ -74,7 +112,7 @@ func (p *Parser) Add(s string) (calls []api.ToolCall, content string) {
 		// whitespace character is { or [
 		if p.tag == "{" || p.tag == "[" {
 			if strings.TrimSpace(content) != "" {
-				p.state = toolsState_Done
+				p.setState(toolsState_Done)
 				return nil, content + string(p.buffer)
 			}
 		}
@@ -83,7 +121,7 @@ func (p *Parser) Add(s string) (calls []api.ToolCall, content string) {
 			return nil, content
 		}
 
-		p.state = toolsState_ToolCalling
+		p.setState(toolsState_ToolCalling)
 	}
 
 	for {
@@ -96,7 +134,7 @@ func (p *Parser) Add(s string) (calls []api.ToolCall, content string) {
 	}
 
 	if p.done() {
-		p.state = toolsState_Done
+		p.setState(toolsState_Done)
 		content = string(p.buffer)
 		p.buffer = []byte{}
 	}

@@ -2,6 +2,7 @@ package parsers
 
 import (
 	"strings"
+	"time"
 	"unicode"
 
 	"github.com/ollama/ollama/api"
@@ -27,6 +28,42 @@ type Nemotron3NanoParser struct {
 	toolParser             *Qwen3CoderParser
 	maybeThinkingOpenAtBOL bool
 	skipThinkingLeadingWS  bool
+	// stateTransition holds the wall-clock time of the last parser state
+	// transition. The zero value means no transition has happened yet.
+	stateTransition time.Time
+	// thinkingTokens counts the bytes of thinking content attributed to the
+	// reasoning phase. It is used as the token-count proxy for [StateProvider].
+	thinkingTokens int
+	// toolCallTokens counts the bytes of tool-call content attributed to the
+	// tool-calling phase. It is used as the token-count proxy for
+	// [StateProvider].
+	toolCallTokens int
+	// answerTokens counts the bytes of answer content attributed to the
+	// answer phase. It is used as the token-count proxy for [StateProvider].
+	answerTokens int
+}
+
+// StateTransitionTime returns the wall-clock time at which the parser last
+// transitioned to a different state, or the zero time if no transition has
+// happened yet.
+func (p *Nemotron3NanoParser) StateTransitionTime() time.Time {
+	return p.stateTransition
+}
+
+// ThinkingTokens returns the number of thinking-content bytes attributed to
+// the reasoning phase, used as the token-count proxy for [StateProvider].
+func (p *Nemotron3NanoParser) ThinkingTokens() int { return p.thinkingTokens }
+
+// ToolCallTokens returns the number of tool-call-content bytes attributed to
+// the tool-calling phase, used as the token-count proxy for [StateProvider].
+// setState transitions the parser to next, recording the wall-clock time of
+// the transition. No time is recorded when the state does not change.
+func (p *Nemotron3NanoParser) setState(next Nemotron3NanoParserState) {
+	if p.state == next {
+		return
+	}
+	p.stateTransition = time.Now()
+	p.state = next
 }
 
 func (p *Nemotron3NanoParser) HasToolSupport() bool     { return true }
@@ -54,6 +91,7 @@ func (p *Nemotron3NanoParser) Init(tools []api.Tool, lastMessage *api.Message, t
 	p.buffer.Reset()
 	p.maybeThinkingOpenAtBOL = false
 	p.skipThinkingLeadingWS = false
+	p.stateTransition = time.Time{}
 
 	thinkingEnabled := thinkValue == nil || thinkValue.Bool()
 	prefill := lastMessage != nil && lastMessage.Role == "assistant"
@@ -78,7 +116,7 @@ func (p *Nemotron3NanoParser) Add(s string, done bool) (content string, thinking
 		if s == "" {
 			return "", "", nil, nil
 		}
-		p.state = Nemotron3NanoCollectingContent
+		p.setState(Nemotron3NanoCollectingContent)
 		return p.toolParser.Add(s, done)
 	}
 
@@ -135,9 +173,9 @@ func (p *Nemotron3NanoParser) Add(s string, done bool) (content string, thinking
 		p.buffer.Reset()
 
 		if remainder == "" {
-			p.state = Nemotron3NanoSkipWhitespaceAfterThinking
+			p.setState(Nemotron3NanoSkipWhitespaceAfterThinking)
 		} else {
-			p.state = Nemotron3NanoCollectingContent
+			p.setState(Nemotron3NanoCollectingContent)
 			content, _, calls, err = p.toolParser.Add(remainder, done)
 		}
 		return content, thinking, calls, err

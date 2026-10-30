@@ -7,6 +7,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/ollama/ollama/api"
 	"github.com/ollama/ollama/logutil"
@@ -29,6 +30,58 @@ type Olmo3Parser struct {
 	state     olmo3ParserState
 	buffer    strings.Builder
 	callIndex int
+	// stateTransition holds the wall-clock time of the last parser state
+	// transition. The zero value means no transition has happened yet.
+	stateTransition time.Time
+	// thinkingTokens counts the bytes of thinking content attributed to the
+	// reasoning phase. It is used as the token-count proxy for [StateProvider].
+	thinkingTokens int
+	// toolCallTokens counts the bytes of tool-call content attributed to the
+	// tool-calling phase. It is used as the token-count proxy for
+	// [StateProvider].
+	toolCallTokens int
+	// answerTokens counts the bytes of answer content attributed to the
+	// answer phase. It is used as the token-count proxy for [StateProvider].
+	answerTokens int
+}
+
+// StateTransitionTime returns the wall-clock time at which the parser last
+// transitioned to a different state, or the zero time if no transition has
+// happened yet.
+func (p *Olmo3Parser) StateTransitionTime() time.Time {
+	return p.stateTransition
+}
+
+// ThinkingTokens returns the number of thinking-content bytes attributed to
+// the reasoning phase, used as the token-count proxy for [StateProvider].
+func (p *Olmo3Parser) ThinkingTokens() int { return p.thinkingTokens }
+
+// ToolCallTokens returns the number of tool-call-content bytes attributed to
+// the tool-calling phase, used as the token-count proxy for [StateProvider].
+func (p *Olmo3Parser) ToolCallTokens() int { return p.toolCallTokens }
+
+// AnswerTokens returns the number of answer-content bytes attributed to the
+// answer phase, used as the token-count proxy for [StateProvider].
+func (p *Olmo3Parser) AnswerTokens() int { return p.answerTokens }
+
+// StateName returns the normalized name of the parser's current state:
+// "toolCalling" while tool calls are being collected and "answer" otherwise
+// (including the state after the tool calls are done).
+func (p *Olmo3Parser) StateName() string {
+	if p.state == olmo3StateToolCalls {
+		return phaseToolCalling
+	}
+	return phaseAnswer
+}
+
+// setState transitions the parser to next, recording the wall-clock time of
+// the transition. No time is recorded when the state does not change.
+func (p *Olmo3Parser) setState(next olmo3ParserState) {
+	if p.state == next {
+		return
+	}
+	p.stateTransition = time.Now()
+	p.state = next
 }
 
 func (p *Olmo3Parser) HasToolSupport() bool {
@@ -51,6 +104,7 @@ func (p *Olmo3Parser) PreservedTokens() []string {
 }
 
 func (p *Olmo3Parser) Init(tools []api.Tool, lastMessage *api.Message, thinkValue *api.ThinkValue) []api.Tool {
+	p.stateTransition = time.Time{}
 	p.state = olmo3StateContent
 	p.callIndex = 0
 	return tools
@@ -92,6 +146,7 @@ func (p *Olmo3Parser) Add(s string, done bool) (content string, thinking string,
 		switch event := event.(type) {
 		case olmo3ParserEventContent:
 			contentSb.WriteString(event.content)
+			p.answerTokens += len(event.content)
 		case olmo3ParserEventToolCalls:
 			allCalls = append(allCalls, event.calls...)
 		}
@@ -141,7 +196,7 @@ func (p *Olmo3Parser) eat() ([]olmo3ParserEvent, bool) {
 
 			p.buffer.Reset()
 			p.buffer.WriteString(remaining)
-			p.state = olmo3StateToolCalls
+			p.setState(olmo3StateToolCalls)
 
 			if len(content) > 0 {
 				events = append(events, olmo3ParserEventContent{content: content})
@@ -175,7 +230,7 @@ func (p *Olmo3Parser) eat() ([]olmo3ParserEvent, bool) {
 
 			p.buffer.Reset()
 			p.buffer.WriteString(remaining)
-			p.state = olmo3StateToolCallsDone
+			p.setState(olmo3StateToolCallsDone)
 
 			// Parse the function calls
 			calls, err := parseOlmo3FunctionCalls(toolCallsStr)
@@ -195,7 +250,7 @@ func (p *Olmo3Parser) eat() ([]olmo3ParserEvent, bool) {
 	case olmo3StateToolCallsDone:
 		// After tool calls, emit remaining content
 		p.buffer.Reset()
-		p.state = olmo3StateContent
+		p.setState(olmo3StateContent)
 		if len(bufStr) > 0 {
 			events = append(events, olmo3ParserEventContent{content: bufStr})
 		}

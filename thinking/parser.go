@@ -2,10 +2,20 @@ package thinking
 
 import (
 	"strings"
+	"time"
 	"unicode"
 )
 
 type thinkingState int
+
+// Normalized phase names exposed via [Parser.StateName]; they must match the
+// phase vocabulary of the server package's PhaseClock.
+const (
+	phaseThinking     = "thinking"
+	phaseThinkingDone = "thinkingDone"
+	phaseToolCalling  = "toolCalling"
+	phaseAnswer       = "answer"
+)
 
 const (
 	// We're looking for the opening tag, but we haven't seen any non-whitespace
@@ -49,6 +59,57 @@ type Parser struct {
 	OpeningTag string
 	ClosingTag string
 	acc        strings.Builder
+	// stateTransition holds the wall-clock time of the last parser state
+	// transition. The zero value means no transition has happened yet.
+	stateTransition time.Time
+	// thinkingTokens counts the bytes of thinking content attributed to the
+	// reasoning phase. It is used as the token-count proxy for [StateProvider].
+	thinkingTokens int
+	// answerTokens counts the bytes of answer content attributed to the answer
+	// phase. It is used as the token-count proxy for [StateProvider].
+	answerTokens int
+}
+
+// StateTransitionTime returns the wall-clock time at which the parser last
+// transitioned to a different state, or the zero time if no transition has
+// happened yet.
+func (s *Parser) StateTransitionTime() time.Time {
+	return s.stateTransition
+}
+
+// StateName returns the normalized name of the parser's current state:
+// "thinking" while thinking content is being collected, "thinkingDone" once
+// the closing tag has been seen, and "answer" otherwise.
+func (s *Parser) StateName() string {
+	switch s.state {
+	case thinkingState_ThinkingStartedEatingWhitespace, thinkingState_Thinking:
+		return phaseThinking
+	case thinkingState_ThinkingDoneEatingWhitespace, thinkingState_ThinkingDone:
+		return phaseThinkingDone
+	default:
+		return phaseAnswer
+	}
+}
+
+// ThinkingTokens returns the number of thinking-content bytes attributed to
+// the reasoning phase, used as the token-count proxy for [StateProvider].
+func (s *Parser) ThinkingTokens() int { return s.thinkingTokens }
+
+// AnswerTokens returns the number of answer-content bytes attributed to the
+// answer phase, used as the token-count proxy for [StateProvider].
+func (s *Parser) AnswerTokens() int { return s.answerTokens }
+
+// ToolCallTokens returns 0: the thinking parser does not handle tool calls.
+func (s *Parser) ToolCallTokens() int { return 0 }
+
+// setState transitions the parser to next, recording the wall-clock time of
+// the transition. No time is recorded when the state does not change.
+func (s *Parser) setState(next thinkingState) {
+	if s.state == next {
+		return
+	}
+	s.stateTransition = time.Now()
+	s.state = next
 }
 
 // AddContent returns the thinking content and the non-thinking content that
@@ -86,9 +147,9 @@ func eat(s *Parser) (string, string, bool) {
 			s.acc.Reset()
 			s.acc.WriteString(after)
 			if after == "" {
-				s.state = thinkingState_ThinkingStartedEatingWhitespace
+				s.setState(thinkingState_ThinkingStartedEatingWhitespace)
 			} else {
-				s.state = thinkingState_Thinking
+				s.setState(thinkingState_Thinking)
 			}
 			return "", "", true
 		} else if strings.HasPrefix(s.OpeningTag, trimmed) {
@@ -99,7 +160,7 @@ func eat(s *Parser) (string, string, bool) {
 			return "", "", false
 		} else {
 			// didn't see an opening tag, but we have content, so thinking was skipped
-			s.state = thinkingState_ThinkingDone
+			s.setState(thinkingState_ThinkingDone)
 			// note that we use the original content, not the trimmed one because we
 			// don't want to eat any whitespace in the real content if there were no
 			// thinking tags
@@ -113,7 +174,7 @@ func eat(s *Parser) (string, string, bool) {
 		if trimmed == "" {
 			return "", "", false
 		} else {
-			s.state = thinkingState_Thinking
+			s.setState(thinkingState_Thinking)
 			s.acc.WriteString(trimmed)
 			return "", "", true
 		}
@@ -126,10 +187,11 @@ func eat(s *Parser) (string, string, bool) {
 			remaining = strings.TrimLeftFunc(remaining, unicode.IsSpace)
 			s.acc.Reset()
 			if remaining == "" {
-				s.state = thinkingState_ThinkingDoneEatingWhitespace
+				s.setState(thinkingState_ThinkingDoneEatingWhitespace)
 			} else {
-				s.state = thinkingState_ThinkingDone
+				s.setState(thinkingState_ThinkingDone)
 			}
+			s.thinkingTokens += len(thinking)
 			return thinking, remaining, false
 		} else if overlapLen := overlap(acc, s.ClosingTag); overlapLen > 0 {
 			thinking := acc[:len(acc)-overlapLen]
@@ -138,10 +200,12 @@ func eat(s *Parser) (string, string, bool) {
 			// keep track of the candidate closing tag. We have to buffer it until it
 			// becomes disambiguated
 			s.acc.WriteString(remaining)
+			s.thinkingTokens += len(thinking)
 			return thinking, "", false
 		} else {
 			// purely just thinking tokens, so we can return them
 			s.acc.Reset()
+			s.thinkingTokens += len(acc)
 			return acc, "", false
 		}
 	case thinkingState_ThinkingDoneEatingWhitespace:
@@ -149,12 +213,14 @@ func eat(s *Parser) (string, string, bool) {
 		s.acc.Reset()
 		// if we see non-whitespace, we're done eating the leading whitespace of the content
 		if trimmed != "" {
-			s.state = thinkingState_ThinkingDone
+			s.setState(thinkingState_ThinkingDone)
+			s.answerTokens += len(trimmed)
 		}
 		return "", trimmed, false
 	case thinkingState_ThinkingDone:
 		acc := s.acc.String()
 		s.acc.Reset()
+		s.answerTokens += len(acc)
 		return "", acc, false
 	default:
 		panic("unknown state")

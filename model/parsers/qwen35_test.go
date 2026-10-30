@@ -513,3 +513,52 @@ func TestQwen35ParserThinkingTruncatedWithoutCloseTag(t *testing.T) {
 		t.Fatalf("expected no tool calls, got %d", len(calls))
 	}
 }
+
+func TestQwen35ParserStateTransitionTime(t *testing.T) {
+	// note: tags are built from parts to avoid literal tool tags in this file
+	const (
+		thinkOpen  = "<" + "think>"
+		thinkClose = "</" + "think>"
+	)
+
+	p := &Qwen35Parser{}
+	p.Init(nil, nil, &api.ThinkValue{Value: true})
+
+	if !p.StateTransitionTime().IsZero() {
+		t.Fatalf("expected zero StateTransitionTime before any transition, got %v", p.StateTransitionTime())
+	}
+
+	// thinking content without the close tag keeps the parser in the thinking
+	// state, so no transition must be recorded
+	_, thinking, calls, err := p.Add("Let me think about this.", false)
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+	if thinking != "Let me think about this." {
+		t.Fatalf("expected thinking %q, got %q", "Let me think about this.", thinking)
+	}
+	if len(calls) != 0 {
+		t.Fatalf("expected no tool calls, got %d", len(calls))
+	}
+	if !p.StateTransitionTime().IsZero() {
+		t.Fatalf("expected zero StateTransitionTime while still collecting thinking, got %v", p.StateTransitionTime())
+	}
+
+	// closing the thinking block transitions the parser into content collection
+	content, thinking, calls, err := p.Add(thinkClose+"The answer", true)
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+	if thinking != "" {
+		t.Fatalf("expected no thinking, got %q", thinking)
+	}
+	if content != "The answer" {
+		t.Fatalf("expected content %q, got %q", "The answer", content)
+	}
+	if len(calls) != 0 {
+		t.Fatalf("expected no tool calls, got %d", len(calls))
+	}
+	if p.StateTransitionTime().IsZero() {
+		t.Fatal("expected non-zero StateTransitionTime after the thinking phase ended")
+	}
+}

@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"regexp"
 	"strings"
+	"time"
 	"unicode"
 	"unicode/utf8"
 
@@ -41,6 +42,51 @@ type Gemma4Parser struct {
 	thinkingEnabled       bool // true when both model supports and user requested thinking
 	contentPrefill        bool // true when the prompt continues assistant content
 	needsChannelNameStrip bool // true when we just entered thinking and need to strip "thought\n"
+	// stateTransition holds the wall-clock time of the last parser state
+	// transition. The zero value means no transition has happened yet.
+	stateTransition time.Time
+	// thinkingTokens counts the bytes of thinking content attributed to the
+	// reasoning phase. It is used as the token-count proxy for [StateProvider].
+	thinkingTokens int
+	// toolCallTokens counts the bytes of tool-call content attributed to the
+	// tool-calling phase. It is used as the token-count proxy for
+	// [StateProvider].
+	toolCallTokens int
+	// answerTokens counts the bytes of answer content attributed to the
+	// answer phase. It is used as the token-count proxy for [StateProvider].
+	answerTokens int
+}
+
+// StateTransitionTime returns the wall-clock time at which the parser last
+// transitioned to a different state, or the zero time if no transition has
+// happened yet.
+func (p *Gemma4Parser) StateTransitionTime() time.Time {
+	return p.stateTransition
+}
+
+// StateName returns the normalized name of the parser's current state:
+// "thinking" while the thinking block is being collected, "toolCalling" in
+// the tool-call region (including the post-tool-call noise) and "answer"
+// otherwise.
+func (p *Gemma4Parser) StateName() string {
+	switch p.state {
+	case Gemma4CollectingThinking:
+		return phaseThinking
+	case Gemma4CollectingToolCall, Gemma4IgnoringPostToolCallNoise:
+		return phaseToolCalling
+	default:
+		return phaseAnswer
+	}
+}
+
+// setState transitions the parser to next, recording the wall-clock time of
+// the transition. No time is recorded when the state does not change.
+func (p *Gemma4Parser) setState(next Gemma4ParserState) {
+	if p.state == next {
+		return
+	}
+	p.stateTransition = time.Now()
+	p.state = next
 }
 
 func (p *Gemma4Parser) HasToolSupport() bool {
@@ -72,6 +118,7 @@ func (p *Gemma4Parser) PreservedTokens() []string {
 func (p *Gemma4Parser) Init(tools []api.Tool, lastMessage *api.Message, thinkValue *api.ThinkValue) []api.Tool {
 	p.tools = tools
 	p.callIndex = 0
+	p.stateTransition = time.Time{}
 
 	p.contentPrefill = lastMessage != nil && lastMessage.Role == "assistant" && lastMessage.Content != ""
 
@@ -138,6 +185,7 @@ func (p *Gemma4Parser) Add(s string, done bool) (content string, thinking string
 			// When thinking is disabled, silently discard channel content
 		case gemma4EventContent:
 			contentSb.WriteString(event.content)
+			p.answerTokens += len(event.content)
 		}
 	}
 
@@ -192,7 +240,7 @@ func (p *Gemma4Parser) eat(done bool) ([]gemma4Event, bool) {
 
 			p.buffer.Reset()
 			p.buffer.WriteString(remaining)
-			p.state = Gemma4CollectingThinking
+			p.setState(Gemma4CollectingThinking)
 			p.needsChannelNameStrip = true
 
 			if contentBefore = strings.TrimRightFunc(contentBefore, unicode.IsSpace); len(contentBefore) > 0 {
@@ -208,7 +256,7 @@ func (p *Gemma4Parser) eat(done bool) ([]gemma4Event, bool) {
 
 			p.buffer.Reset()
 			p.buffer.WriteString(remaining)
-			p.state = Gemma4CollectingToolCall
+			p.setState(Gemma4CollectingToolCall)
 
 			if contentBefore = strings.TrimRightFunc(contentBefore, unicode.IsSpace); len(contentBefore) > 0 {
 				events = append(events, gemma4EventContent{content: contentBefore})
@@ -267,7 +315,7 @@ func (p *Gemma4Parser) eat(done bool) ([]gemma4Event, bool) {
 
 			p.buffer.Reset()
 			p.buffer.WriteString(remaining)
-			p.state = Gemma4CollectingContent
+			p.setState(Gemma4CollectingContent)
 
 			if len(thinking) > 0 {
 				events = append(events, gemma4EventThinkingContent{content: thinking})
@@ -321,7 +369,7 @@ func (p *Gemma4Parser) eat(done bool) ([]gemma4Event, bool) {
 
 			p.buffer.Reset()
 			p.buffer.WriteString(remaining)
-			p.state = Gemma4IgnoringPostToolCallNoise
+			p.setState(Gemma4IgnoringPostToolCallNoise)
 
 			if toolCall, err := parseGemma4ToolCall(toolCallContent, p.tools); err == nil {
 				events = append(events, gemma4EventToolCall{toolCall: toolCall})
@@ -335,7 +383,7 @@ func (p *Gemma4Parser) eat(done bool) ([]gemma4Event, bool) {
 		// The model may hit a stop token before emitting <tool_call|>.
 		if done && len(bufStr) > 0 {
 			p.buffer.Reset()
-			p.state = Gemma4CollectingContent
+			p.setState(Gemma4CollectingContent)
 			if toolCall, err := parseGemma4ToolCall(bufStr, p.tools); err == nil {
 				events = append(events, gemma4EventToolCall{toolCall: toolCall})
 			} else {
@@ -384,12 +432,12 @@ func (p *Gemma4Parser) eat(done bool) ([]gemma4Event, bool) {
 		if strings.HasPrefix(gemma4ToolCallCloseTag, bufStr) || strings.HasPrefix(gemma4ToolResponseTag, bufStr) {
 			if done {
 				p.buffer.Reset()
-				p.state = Gemma4CollectingContent
+				p.setState(Gemma4CollectingContent)
 			}
 			return events, false
 		}
 
-		p.state = Gemma4CollectingContent
+		p.setState(Gemma4CollectingContent)
 		return events, true
 	}
 

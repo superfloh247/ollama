@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"time"
 	"unicode"
 
 	"github.com/ollama/ollama/api"
@@ -42,6 +43,65 @@ type Qwen3Parser struct {
 	hasThinkingSupport     bool
 	defaultThinking        bool
 	maybeThinkingOpenAtBOL bool
+	// stateTransition holds the wall-clock time of the last parser state
+	// transition. The zero value means no transition has happened yet.
+	stateTransition time.Time
+	// thinkingTokens counts the bytes of thinking content attributed to the
+	// reasoning phase. It is used as the token-count proxy for [StateProvider].
+	thinkingTokens int
+	// toolCallTokens counts the bytes of tool-call content attributed to the
+	// tool-calling phase. It is used as the token-count proxy for
+	// [StateProvider].
+	toolCallTokens int
+	// answerTokens counts the bytes of answer content attributed to the
+	// answer phase. It is used as the token-count proxy for [StateProvider].
+	answerTokens int
+}
+
+// StateTransitionTime returns the wall-clock time at which the parser last
+// transitioned to a different state, or the zero time if no transition has
+// happened yet.
+func (p *Qwen3Parser) StateTransitionTime() time.Time {
+	return p.stateTransition
+}
+
+// ThinkingTokens returns the number of thinking-content bytes attributed to
+// the reasoning phase, used as the token-count proxy for [StateProvider].
+func (p *Qwen3Parser) ThinkingTokens() int { return p.thinkingTokens }
+
+// ToolCallTokens returns the number of tool-call-content bytes attributed to
+// the tool-calling phase, used as the token-count proxy for [StateProvider].
+func (p *Qwen3Parser) ToolCallTokens() int { return p.toolCallTokens }
+
+// AnswerTokens returns the number of answer-content bytes attributed to the
+// answer phase, used as the token-count proxy for [StateProvider].
+func (p *Qwen3Parser) AnswerTokens() int { return p.answerTokens }
+
+// StateName returns the normalized name of the parser's current state:
+// "thinking" while the thinking block is being collected, "thinkingDone"
+// directly after the closing tag, "toolCalling" inside the tool-call region
+// and "answer" otherwise.
+func (p *Qwen3Parser) StateName() string {
+	switch p.state {
+	case qwen3ParserStateThinkingStartedEatingWhitespace, qwen3ParserStateCollectingThinking:
+		return phaseThinking
+	case qwen3ParserStateThinkingDoneEatingWhitespace:
+		return phaseThinkingDone
+	case qwen3ParserStateToolStartedEatingWhitespace, qwen3ParserStateCollectingToolContent:
+		return phaseToolCalling
+	default:
+		return phaseAnswer
+	}
+}
+
+// setState transitions the parser to next, recording the wall-clock time of
+// the transition. No time is recorded when the state does not change.
+func (p *Qwen3Parser) setState(next qwen3ParserState) {
+	if p.state == next {
+		return
+	}
+	p.stateTransition = time.Now()
+	p.state = next
 }
 
 func (p *Qwen3Parser) HasToolSupport() bool {
@@ -72,6 +132,7 @@ func (p *Qwen3Parser) Init(tools []api.Tool, lastMessage *api.Message, thinkValu
 	p.tools = tools
 	p.buffer.Reset()
 	p.callIndex = 0
+	p.stateTransition = time.Time{}
 
 	thinkingEnabled := thinkValue != nil && thinkValue.Bool()
 	if thinkValue == nil {
@@ -119,6 +180,7 @@ func (p *Qwen3Parser) Add(s string, done bool) (content string, thinking string,
 	for _, event := range events {
 		switch event := event.(type) {
 		case qwen3EventRawToolCall:
+			p.toolCallTokens += len(event.raw)
 			toolCall, err := parseQwen3ToolCall(event, p.tools)
 			if err != nil {
 				slog.Warn("qwen3 tool call parsing failed", "error", err)
@@ -129,8 +191,10 @@ func (p *Qwen3Parser) Add(s string, done bool) (content string, thinking string,
 			calls = append(calls, toolCall)
 		case qwen3EventThinkingContent:
 			thinkingSb.WriteString(event.content)
+			p.thinkingTokens += len(event.content)
 		case qwen3EventContent:
 			contentSb.WriteString(event.content)
+			p.answerTokens += len(event.content)
 		}
 	}
 
@@ -162,7 +226,7 @@ func (p *Qwen3Parser) eatLeadingWhitespaceAndTransitionTo(nextState qwen3ParserS
 	if trimmed == "" {
 		return nil, false
 	}
-	p.state = nextState
+	p.setState(nextState)
 	p.buffer.WriteString(trimmed)
 	return nil, true
 }
@@ -183,9 +247,9 @@ func (p *Qwen3Parser) eat() ([]qwen3Event, bool) {
 			p.buffer.Reset()
 			p.buffer.WriteString(after)
 			if after == "" {
-				p.state = qwen3ParserStateThinkingStartedEatingWhitespace
+				p.setState(qwen3ParserStateThinkingStartedEatingWhitespace)
 			} else {
-				p.state = qwen3ParserStateCollectingThinking
+				p.setState(qwen3ParserStateCollectingThinking)
 			}
 			return events, true
 		} else if strings.HasPrefix(qwen3ThinkingOpenTag, trimmed) {
@@ -193,7 +257,7 @@ func (p *Qwen3Parser) eat() ([]qwen3Event, bool) {
 		} else if trimmed == "" {
 			return events, false
 		}
-		p.state = qwen3ParserStateCollectingContent
+		p.setState(qwen3ParserStateCollectingContent)
 		return events, true
 
 	case qwen3ParserStateThinkingStartedEatingWhitespace:
@@ -235,9 +299,9 @@ func (p *Qwen3Parser) eat() ([]qwen3Event, bool) {
 				events = append(events, qwen3EventThinkingContent{content: before})
 			}
 			if after == "" {
-				p.state = qwen3ParserStateToolStartedEatingWhitespace
+				p.setState(qwen3ParserStateToolStartedEatingWhitespace)
 			} else {
-				p.state = qwen3ParserStateCollectingToolContent
+				p.setState(qwen3ParserStateCollectingToolContent)
 			}
 			return events, true
 		}
@@ -248,9 +312,9 @@ func (p *Qwen3Parser) eat() ([]qwen3Event, bool) {
 				events = append(events, qwen3EventThinkingContent{content: thinking})
 			}
 			if remaining == "" {
-				p.state = qwen3ParserStateThinkingDoneEatingWhitespace
+				p.setState(qwen3ParserStateThinkingDoneEatingWhitespace)
 			} else {
-				p.state = qwen3ParserStateCollectingContent
+				p.setState(qwen3ParserStateCollectingContent)
 			}
 			return events, true
 		} else if overlapLen := max(overlap(acc, qwen3ThinkingCloseTag), overlap(acc, qwen3ToolOpenTag)); overlapLen > 0 {
@@ -290,9 +354,9 @@ func (p *Qwen3Parser) eat() ([]qwen3Event, bool) {
 				events = append(events, qwen3EventContent{content: before})
 			}
 			if after == "" {
-				p.state = qwen3ParserStateToolStartedEatingWhitespace
+				p.setState(qwen3ParserStateToolStartedEatingWhitespace)
 			} else {
-				p.state = qwen3ParserStateCollectingToolContent
+				p.setState(qwen3ParserStateCollectingToolContent)
 			}
 			return events, true
 		} else if overlapLen := overlap(acc, qwen3ToolOpenTag); overlapLen > 0 {
@@ -332,7 +396,7 @@ func (p *Qwen3Parser) eat() ([]qwen3Event, bool) {
 				slog.Warn("qwen3 tool call closing tag found but no content before it")
 			}
 			events = append(events, qwen3EventRawToolCall{raw: toolContent})
-			p.state = qwen3ParserStateCollectingContent
+			p.setState(qwen3ParserStateCollectingContent)
 			return events, true
 		}
 		return events, false

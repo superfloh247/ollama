@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"time"
 
 	"github.com/ollama/ollama/api"
 )
@@ -46,6 +47,63 @@ type GlimmerParser struct {
 	// fallback only applies while nothing has streamed, so a message either
 	// becomes a tool call or streams as content — never half of each.
 	contentStreamed bool
+	// stateTransition holds the wall-clock time of the last parser state
+	// transition. The zero value means no transition has happened yet.
+	stateTransition time.Time
+	// thinkingTokens counts the bytes of thinking content attributed to the
+	// reasoning phase. It is used as the token-count proxy for [StateProvider].
+	thinkingTokens int
+	// toolCallTokens counts the bytes of tool-call content attributed to the
+	// tool-calling phase. It is used as the token-count proxy for
+	// [StateProvider].
+	toolCallTokens int
+	// answerTokens counts answer bytes.
+	answerTokens int
+	// answerTokens counts the bytes of answer content attributed to the
+	// answer phase. It is used as the token-count proxy for [StateProvider].
+}
+
+// StateTransitionTime returns the wall-clock time at which the parser last
+// transitioned to a different state, or the zero time if no transition has
+// happened yet.
+func (p *GlimmerParser) StateTransitionTime() time.Time {
+	return p.stateTransition
+}
+
+// ThinkingTokens returns the number of thinking-content bytes attributed to
+// the reasoning phase, used as the token-count proxy for [StateProvider].
+func (p *GlimmerParser) ThinkingTokens() int { return p.thinkingTokens }
+
+// ToolCallTokens returns the number of tool-call-content bytes attributed to
+// the tool-calling phase, used as the token-count proxy for [StateProvider].
+func (p *GlimmerParser) ToolCallTokens() int { return p.toolCallTokens }
+
+// AnswerTokens returns the number of answer-content bytes attributed to the
+// answer phase, used as the token-count proxy for [StateProvider].
+func (p *GlimmerParser) AnswerTokens() int { return p.answerTokens }
+
+// StateName returns the normalized name of the parser's current state:
+// "thinking" in the analysis channel, "toolCalling" in a tool channel and
+// "answer" in the content/header states.
+func (p *GlimmerParser) StateName() string {
+	switch p.state {
+	case glimmerParserThinking:
+		return phaseThinking
+	case glimmerParserTool:
+		return phaseToolCalling
+	default:
+		return phaseAnswer
+	}
+}
+
+// setState transitions the parser to next, recording the wall-clock time of
+// the transition. No time is recorded when the state does not change.
+func (p *GlimmerParser) setState(next glimmerParserState) {
+	if p.state == next {
+		return
+	}
+	p.stateTransition = time.Now()
+	p.state = next
 }
 
 func (p *GlimmerParser) HasToolSupport() bool     { return true }
@@ -70,12 +128,17 @@ func (p *GlimmerParser) PreservedTokens() []string {
 
 func (p *GlimmerParser) Init(tools []api.Tool, lastMessage *api.Message, thinkValue *api.ThinkValue) []api.Tool {
 	p.state = glimmerParserHeader
+	p.stateTransition = time.Time{}
 	p.buffer.Reset()
 	p.recipient = ""
 	p.tools = glimmerToolsByName(tools)
 	p.callIndex = 0
 	p.emitThinking = thinkValue == nil || thinkValue.Bool()
 	p.contentStreamed = false
+	p.thinkingTokens = 0
+	p.toolCallTokens = 0
+	p.answerTokens = 0
+	p.answerTokens = 0
 	return tools
 }
 
@@ -87,6 +150,7 @@ func (p *GlimmerParser) Add(s string, done bool) (content string, thinking strin
 		if p.state == glimmerParserHeader {
 			progress, fallback := p.consumeHeader(done)
 			contentSB.WriteString(fallback)
+			p.answerTokens += len(fallback)
 			if !progress {
 				break
 			}
@@ -100,14 +164,17 @@ func (p *GlimmerParser) Add(s string, done bool) (content string, thinking strin
 				calls = append(calls, call)
 			} else if body != "" {
 				contentSB.WriteString(body)
+				p.answerTokens += len(body)
 				p.contentStreamed = true
 			}
 		case glimmerParserThinking:
 			if p.emitThinking {
 				thinkingSB.WriteString(body)
+				p.thinkingTokens += len(body)
 			}
 		case glimmerParserTool:
 			if complete {
+				p.toolCallTokens += len(body)
 				call, parseErr := p.parseToolCall(body)
 				if parseErr != nil {
 					return contentSB.String(), thinkingSB.String(), calls, parseErr
@@ -116,7 +183,7 @@ func (p *GlimmerParser) Add(s string, done bool) (content string, thinking strin
 			}
 		}
 		if complete {
-			p.state = glimmerParserHeader
+			p.setState(glimmerParserHeader)
 			p.recipient = ""
 			p.contentStreamed = false
 		}
@@ -159,11 +226,11 @@ func (p *GlimmerParser) setStateForRecipient() {
 	_, isTool := glimmerResolveToolName(p.tools, p.recipient)
 	switch {
 	case p.recipient == "self":
-		p.state = glimmerParserThinking
+		p.setState(glimmerParserThinking)
 	case isTool:
-		p.state = glimmerParserTool
+		p.setState(glimmerParserTool)
 	default:
-		p.state = glimmerParserContent
+		p.setState(glimmerParserContent)
 	}
 }
 
