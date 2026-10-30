@@ -760,6 +760,8 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 		// phaseClock collects the wall-clock time points of the parser phase
 		// transitions for the token metrics.
 		phaseClock := &PhaseClock{}
+		generatedText := newGeneratedTokenText(s.metricsLogger != nil)
+		tokenize := r.Tokenize
 
 		// A raw prompt gives no way to tell where the response starts, so the
 		// format applies from its first token.
@@ -782,9 +784,7 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 			ThinkingClose:   thinkingClose,
 		}, func(cr llm.CompletionResponse) {
 			phaseClock.Begin()
-			if firstToken.IsZero() && cr.Content != "" {
-				firstToken = time.Now()
-			}
+			noteFirstGeneratedToken(&firstToken, time.Now(), cr.Content, "", nil)
 			res := api.GenerateResponse{
 				Model:     req.Model,
 				CreatedAt: time.Now().UTC(),
@@ -810,14 +810,25 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 				notePhaseClock(phaseClock, builtinParser)
 				res.Response = content
 				res.Thinking = thinking
-				if cr.Done && len(toolCalls) > 0 {
-					res.ToolCalls = toolCalls
+				generatedText.addReasoning(thinking)
+				generatedText.addAnswer(content)
+				if len(toolCalls) > 0 {
+					if cr.Done {
+						res.ToolCalls = toolCalls
+					}
+					if err := generatedText.addToolCalls(toolCalls); err != nil {
+						slog.Warn("failed to record generated tool-call text", "model", req.Model, "error", err)
+					}
 				}
 			} else if thinkTagParser != nil {
 				thinking, content := thinkTagParser.AddContent(cr.Content)
 				notePhaseClock(phaseClock, thinkTagParser)
 				res.Thinking = thinking
 				res.Response = content
+				generatedText.addReasoning(thinking)
+				generatedText.addAnswer(content)
+			} else {
+				generatedText.addAnswer(cr.Content)
 			}
 
 			if _, err := sb.WriteString(cr.Content); err != nil {
@@ -847,7 +858,7 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 				timing.ReasoningStart = reasoningStart
 				timing.ToolCallStart = toolCallStart
 				timing.AnswerStart = answerStart
-				s.logTokenMetrics(req.Model, res.Metrics, timing, metricsParser)
+				s.logTokenMetricsWithTokenizer(c.Request.Context(), req.Model, res.Metrics, timing, tokenize, generatedText)
 
 				if !req.Raw {
 					tokens, err := r.Tokenize(c.Request.Context(), prompt+sb.String())
@@ -3393,6 +3404,8 @@ func (s *Server) ChatHandler(c *gin.Context) {
 		// phaseClock collects the wall-clock time points of the parser phase
 		// transitions for the token metrics.
 		phaseClock := &PhaseClock{}
+		generatedText := newGeneratedTokenText(s.metricsLogger != nil)
+		tokenize := r.Tokenize
 
 		err := r.Completion(ctx, llm.CompletionRequest{
 			Prompt:          prompt,
@@ -3409,9 +3422,7 @@ func (s *Server) ChatHandler(c *gin.Context) {
 			ThinkingClose:   thinkingCloseForCompletion(builtinParser, thinkTagParser),
 		}, func(r llm.CompletionResponse) {
 			phaseClock.Begin()
-			if firstToken.IsZero() && r.Content != "" {
-				firstToken = time.Now()
-			}
+			noteFirstGeneratedToken(&firstToken, time.Now(), r.Content, "", nil)
 			res := api.ChatResponse{
 				Model:     req.Model,
 				CreatedAt: time.Now().UTC(),
@@ -3427,32 +3438,6 @@ func (s *Server) ChatHandler(c *gin.Context) {
 				Logprobs: toAPILogprobs(r.Logprobs),
 			}
 
-			if r.Done {
-				res.DoneReason = r.DoneReason.String()
-				res.TotalDuration = time.Since(checkpointStart)
-				res.LoadDuration = checkpointLoaded.Sub(checkpointStart)
-
-				// Token metrics logging: derive the timing breakdown (time to
-				// first token, prompt evaluation) and derive the phase
-				// durations from the parser phase transition time points
-				// collected during the request.
-				metricsParser := metricsStateProvider(builtinParser, thinkTagParser, toolParser)
-				timing := collectTiming(checkpointStart, firstToken, res.Metrics, metricsParser)
-				// When no per-phase token data is available, fall back to the wall-clock
-				// phase durations so the reasoning/tool-call split is still reported.
-				if timing.Reasoning == 0 && timing.ToolCall == 0 && res.Metrics.EvalDuration > 0 {
-					timing.Answer, timing.Reasoning, timing.ToolCall = phaseClock.Durations(res.Metrics.EvalDuration)
-				}
-				// Phase start time points collected from the parser state
-				// during the request; zero when the phase was not
-				// observed.
-				_, reasoningStart, toolCallStart, answerStart := phaseClock.StartTimes()
-				timing.ReasoningStart = reasoningStart
-				timing.ToolCallStart = toolCallStart
-				timing.AnswerStart = answerStart
-				s.logTokenMetrics(req.Model, res.Metrics, timing, metricsParser)
-			}
-
 			if builtinParser != nil {
 				slog.Log(ctx, logutil.LevelTrace, "builtin parser input", "parser", parserName, "content", r.Content)
 
@@ -3466,10 +3451,31 @@ func (s *Server) ChatHandler(c *gin.Context) {
 
 				res.Message.Content = content
 				res.Message.Thinking = thinking
+				generatedText.addReasoning(thinking)
+				generatedText.addAnswer(content)
 				for i := range toolCalls {
 					toolCalls[i].ID = toolCallId()
 				}
 				res.Message.ToolCalls = toolCalls
+				if err := generatedText.addToolCalls(toolCalls); err != nil {
+					slog.Warn("failed to record generated tool-call text", "model", req.Model, "error", err)
+				}
+
+				if r.Done {
+					res.DoneReason = r.DoneReason.String()
+					res.TotalDuration = time.Since(checkpointStart)
+					res.LoadDuration = checkpointLoaded.Sub(checkpointStart)
+					metricsParser := metricsStateProvider(builtinParser, thinkTagParser, toolParser)
+					timing := collectTiming(checkpointStart, firstToken, res.Metrics, metricsParser)
+					if timing.Reasoning == 0 && timing.ToolCall == 0 && res.Metrics.EvalDuration > 0 {
+						timing.Answer, timing.Reasoning, timing.ToolCall = phaseClock.Durations(res.Metrics.EvalDuration)
+					}
+					_, reasoningStart, toolCallStart, answerStart := phaseClock.StartTimes()
+					timing.ReasoningStart = reasoningStart
+					timing.ToolCallStart = toolCallStart
+					timing.AnswerStart = answerStart
+					s.logTokenMetricsWithTokenizer(c.Request.Context(), req.Model, res.Metrics, timing, tokenize, generatedText)
+				}
 
 				if res.Message.Content != "" || res.Message.Thinking != "" || len(res.Message.ToolCalls) > 0 || r.Done || len(res.Logprobs) > 0 {
 					slog.Log(ctx, logutil.LevelTrace, "builtin parser output", "parser", parserName, "content", content, "thinking", thinking, "toolCalls", toolCalls, "done", r.Done)
@@ -3483,6 +3489,7 @@ func (s *Server) ChatHandler(c *gin.Context) {
 			if thinkTagParser != nil {
 				thinkingContent, remainingContent := thinkTagParser.AddContent(res.Message.Content)
 				notePhaseClock(phaseClock, thinkTagParser)
+				generatedText.addReasoning(thinkingContent)
 				if thinkingContent == "" && remainingContent == "" && !r.Done {
 					// need to accumulate more to decide what to send
 					return
@@ -3494,6 +3501,10 @@ func (s *Server) ChatHandler(c *gin.Context) {
 			if len(req.Tools) > 0 {
 				toolCalls, content := toolParser.Add(res.Message.Content)
 				notePhaseClock(phaseClock, toolParser)
+				generatedText.addAnswer(content)
+				if err := generatedText.addToolCalls(toolCalls); err != nil {
+					slog.Warn("failed to record generated tool-call text", "model", req.Model, "error", err)
+				}
 				if len(content) > 0 {
 					res.Message.Content = content
 				} else if len(toolCalls) > 0 {
@@ -3515,12 +3526,45 @@ func (s *Server) ChatHandler(c *gin.Context) {
 
 					if r.Done {
 						res.Message.Content = toolParser.Content()
+						generatedText.addAnswer(res.Message.Content)
+						res.DoneReason = r.DoneReason.String()
+						res.TotalDuration = time.Since(checkpointStart)
+						res.LoadDuration = checkpointLoaded.Sub(checkpointStart)
+						metricsParser := metricsStateProvider(builtinParser, thinkTagParser, toolParser)
+						timing := collectTiming(checkpointStart, firstToken, res.Metrics, metricsParser)
+						if timing.Reasoning == 0 && timing.ToolCall == 0 && res.Metrics.EvalDuration > 0 {
+							timing.Answer, timing.Reasoning, timing.ToolCall = phaseClock.Durations(res.Metrics.EvalDuration)
+						}
+						_, reasoningStart, toolCallStart, answerStart := phaseClock.StartTimes()
+						timing.ReasoningStart = reasoningStart
+						timing.ToolCallStart = toolCallStart
+						timing.AnswerStart = answerStart
+						s.logTokenMetricsWithTokenizer(c.Request.Context(), req.Model, res.Metrics, timing, tokenize, generatedText)
 						ch <- res
 					}
 					return
 				}
+			} else if thinkTagParser != nil {
+				generatedText.addAnswer(res.Message.Content)
+			} else {
+				generatedText.addAnswer(res.Message.Content)
 			}
 
+			if r.Done {
+				res.DoneReason = r.DoneReason.String()
+				res.TotalDuration = time.Since(checkpointStart)
+				res.LoadDuration = checkpointLoaded.Sub(checkpointStart)
+				metricsParser := metricsStateProvider(builtinParser, thinkTagParser, toolParser)
+				timing := collectTiming(checkpointStart, firstToken, res.Metrics, metricsParser)
+				if timing.Reasoning == 0 && timing.ToolCall == 0 && res.Metrics.EvalDuration > 0 {
+					timing.Answer, timing.Reasoning, timing.ToolCall = phaseClock.Durations(res.Metrics.EvalDuration)
+				}
+				_, reasoningStart, toolCallStart, answerStart := phaseClock.StartTimes()
+				timing.ReasoningStart = reasoningStart
+				timing.ToolCallStart = toolCallStart
+				timing.AnswerStart = answerStart
+				s.logTokenMetricsWithTokenizer(c.Request.Context(), req.Model, res.Metrics, timing, tokenize, generatedText)
+			}
 			ch <- res
 		})
 		if parserErr != nil {
@@ -3601,63 +3645,28 @@ func (s *Server) handleNativeChat(c *gin.Context, req api.ChatRequest, m *Model,
 		// chunk; it is used to compute the time-to-first-token metric.
 		var firstToken time.Time
 
-		// phaseClock collects the wall-clock time points of the parser phase
-		// transitions for the token metrics. Native chat does not
-		// use a stream parser, so no phase transitions are recorded; only the
-		// start time of the first stream chunk is collected.
+		// phaseClock collects phase transitions from the structured response.
 		phaseClock := &PhaseClock{}
-
-		// Create a parser for token metrics tracking. Native chat uses
-		// llama.cpp's built-in chat template handling, so we need to feed
-		// the response through a parser to count thinking/tool-call tokens.
-		parserName := parserNameForModel(m)
-		var builtinParser parsers.Parser
-		if parserName != "" {
-			builtinParser = parsers.ParserForName(parserName)
-			if builtinParser != nil {
-				var lastMessage *api.Message
-				if len(msgs) > 0 {
-					lastMessage = &msgs[len(msgs)-1]
-				}
-				builtinParser.Init(req.Tools, lastMessage, req.Think)
-			}
-		}
+		generatedText := newGeneratedTokenText(s.metricsLogger != nil)
+		tokenize := r.Tokenize
 
 		err := r.Chat(c.Request.Context(), nativeReq, func(r llm.ChatResponse) {
 			phaseClock.Begin()
-			if firstToken.IsZero() && r.Message.Content != "" {
-				firstToken = time.Now()
+			now := time.Now()
+			noteFirstGeneratedToken(&firstToken, now, r.Message.Content, r.Message.Thinking, r.Message.ToolCalls)
+			if r.Message.Thinking != "" {
+				generatedText.addReasoning(r.Message.Thinking)
+				phaseClock.NotePhase(phaseStateThinking, now)
 			}
-
-			// Feed the response through the parser so it can count
-			// thinking and tool-call tokens. Native chat separates
-			// thinking from content, so reconstruct the full output
-			// with thinking tags and tool-call XML tags for the parser
-			// to recognize.
-			if builtinParser != nil {
-				var sb strings.Builder
-				if r.Message.Thinking != "" {
-					sb.WriteString("」")
-					sb.WriteString(r.Message.Thinking)
-					sb.WriteString("」")
+			if len(r.Message.ToolCalls) > 0 {
+				if err := generatedText.addToolCalls(r.Message.ToolCalls); err != nil {
+					slog.Warn("failed to record generated tool-call text", "model", req.Model, "error", err)
 				}
-				for _, toolCall := range r.Message.ToolCalls {
-					sb.WriteString("<tool_call><function=")
-					sb.WriteString(toolCall.Function.Name)
-					sb.WriteString(">\n")
-					// Serialize function arguments to JSON inside the XML tag
-					argsBytes, err := json.Marshal(toolCall.Function.Arguments)
-					if err == nil {
-						sb.Write(argsBytes)
-					}
-					sb.WriteString("\n</tool_call>")
-				}
-				sb.WriteString(r.Message.Content)
-				_, _, _, err := builtinParser.Add(sb.String(), r.Done)
-				if err != nil {
-					slog.Warn("native chat parser failed", "error", err)
-				}
-				notePhaseClock(phaseClock, builtinParser)
+				phaseClock.NotePhase(phaseStateToolCalling, now)
+			}
+			if r.Message.Content != "" {
+				generatedText.addAnswer(r.Message.Content)
+				phaseClock.NotePhase(phaseStateAnswer, now)
 			}
 
 			res := api.ChatResponse{
@@ -3688,8 +3697,7 @@ func (s *Server) handleNativeChat(c *gin.Context, req api.ChatRequest, m *Model,
 				// first token, prompt evaluation) and derive the phase
 				// durations from the parser phase transition time points
 				// collected during the request.
-				metricsParser := metricsStateProvider(builtinParser)
-				timing := collectTiming(checkpointStart, firstToken, res.Metrics, metricsParser)
+				timing := collectTiming(checkpointStart, firstToken, res.Metrics, nil)
 				// When no per-phase token data is available, fall back to the wall-clock
 				// phase durations so the reasoning/tool-call split is still reported.
 				if timing.Reasoning == 0 && timing.ToolCall == 0 && res.Metrics.EvalDuration > 0 {
@@ -3702,7 +3710,7 @@ func (s *Server) handleNativeChat(c *gin.Context, req api.ChatRequest, m *Model,
 				timing.ReasoningStart = reasoningStart
 				timing.ToolCallStart = toolCallStart
 				timing.AnswerStart = answerStart
-				s.logTokenMetrics(req.Model, res.Metrics, timing, metricsParser)
+				s.logTokenMetricsWithTokenizer(c.Request.Context(), req.Model, res.Metrics, timing, tokenize, generatedText)
 			}
 
 			ch <- res

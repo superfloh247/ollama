@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -164,41 +165,11 @@ func tokensPerSecond(count int, duration time.Duration) float64 {
 }
 
 // logTokenMetrics appends one JSONL line with the token metrics of a finished
-// request to the metrics log. It is a no-op when metrics logging is disabled
-// (s.metricsLogger == nil, including after a failed Open). Generated tokens are
-// split across reasoning / tool-call / answer phases using the parser's
-// per-phase token counts ([splitGeneratedTokens]) when a parser state is
-// provided; otherwise they fall back to splitting proportionally to the time
-// spent in each phase (from [MetricsTiming]). When no phase timing is
-// available (no parser state machine or zero eval duration) all tokens fall
-// to answer.
-func (s *Server) logTokenMetrics(model string, m api.Metrics, timing MetricsTiming, parser StateProvider) {
+// request to the metrics log. Generated-token phase counts are derived from
+// tokenized parsed output and reconciled with the runner's authoritative total.
+func (s *Server) logTokenMetrics(model string, m api.Metrics, timing MetricsTiming, counts generatedTokenCounts) {
 	if s.metricsLogger == nil {
 		return
-	}
-
-	// Split generated tokens across phases. Prefer the parser's per-phase
-	// token counts ([splitGeneratedTokens]); fall back to splitting
-	// proportionally to phase duration when no parser state is available.
-	// Integer division floors the reasoning/tool-call counts; answer gets the
-	// remainder so the three always sum exactly to EvalCount.
-	var reasoningTokens, toolCallTokens, answerTokens int
-	if parser != nil {
-		reasoningTokens, toolCallTokens, answerTokens = splitGeneratedTokens(m.EvalCount, parser)
-	} else if m.EvalDuration > 0 {
-		totalSeconds := m.EvalDuration.Seconds()
-		if totalSeconds > 0 {
-			reasoningTokens = int(float64(m.EvalCount) * timing.Reasoning.Seconds() / totalSeconds)
-			toolCallTokens = int(float64(m.EvalCount) * timing.ToolCall.Seconds() / totalSeconds)
-			if reasoningTokens+toolCallTokens > m.EvalCount {
-				toolCallTokens = m.EvalCount - reasoningTokens
-				if toolCallTokens < 0 {
-					toolCallTokens = 0
-					reasoningTokens = m.EvalCount
-				}
-			}
-		}
-		answerTokens = m.EvalCount - reasoningTokens - toolCallTokens
 	}
 
 	entry := tokenMetricsLogEntry{
@@ -207,9 +178,9 @@ func (s *Server) logTokenMetrics(model string, m api.Metrics, timing MetricsTimi
 		InputTokens:        m.PromptEvalCount,
 		CachedTokens:       m.PromptEvalCachedCount,
 		GeneratedTokens:    m.EvalCount,
-		GeneratedReasoning: reasoningTokens,
-		GeneratedToolCalls: toolCallTokens,
-		GeneratedAnswer:    answerTokens,
+		GeneratedReasoning: counts.reasoning,
+		GeneratedToolCalls: counts.toolCalls,
+		GeneratedAnswer:    counts.answer,
 		TimeToFirstToken:   timing.TimeToFirstToken,
 		ParseDuration:      timing.Parse,
 		AnswerDuration:     timing.Answer,
@@ -231,4 +202,26 @@ func (s *Server) logTokenMetrics(model string, m api.Metrics, timing MetricsTimi
 	if _, err := fmt.Fprintln(l.f, string(line)); err != nil {
 		slog.Warn("failed to write token metrics", "model", model, "error", err)
 	}
+}
+
+func (s *Server) logTokenMetricsWithTokenizer(
+	ctx context.Context,
+	model string,
+	m api.Metrics,
+	timing MetricsTiming,
+	tokenize func(context.Context, string) ([]int, error),
+	text *generatedTokenText,
+) {
+	if s.metricsLogger == nil {
+		return
+	}
+	if text == nil {
+		text = &generatedTokenText{}
+	}
+	counts, err := countGeneratedTokenPhases(ctx, m.EvalCount, tokenize, *text)
+	if err != nil {
+		slog.Warn("failed to tokenize generated token phases", "model", model, "error", err)
+		return
+	}
+	s.logTokenMetrics(model, m, timing, counts)
 }

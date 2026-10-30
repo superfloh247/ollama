@@ -170,7 +170,7 @@ func TestLogTokenMetrics(t *testing.T) {
 		Reasoning:        50 * time.Millisecond,
 		ToolCall:         50 * time.Millisecond,
 	}
-	s.logTokenMetrics("test-model", m, timing, nil)
+	s.logTokenMetrics("test-model", m, timing, generatedTokenCounts{reasoning: 1, toolCalls: 1, answer: 28})
 
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -187,9 +187,9 @@ func TestLogTokenMetrics(t *testing.T) {
 	}
 
 	cases := map[string]float64{
-		"input_tokens":                     100,
-		"cached_tokens":                    40,
-		"generated_tokens":                 30,
+		"input_tokens":     100,
+		"cached_tokens":    40,
+		"generated_tokens": 30,
 		// 50ms reasoning + 50ms tool call out of 1s total:
 		// reasoningTokens = int(30 * 0.05 / 1.0) = 1
 		// toolCallTokens  = int(30 * 0.05 / 1.0) = 1
@@ -222,7 +222,7 @@ func TestLogTokenMetrics(t *testing.T) {
 
 func TestLogTokenMetricsNoOpWhenDisabled(t *testing.T) {
 	s := &Server{metricsLogger: nil}
-	s.logTokenMetrics("test-model", api.Metrics{PromptEvalCount: 10, EvalCount: 5}, MetricsTiming{}, nil)
+	s.logTokenMetrics("test-model", api.Metrics{PromptEvalCount: 10, EvalCount: 5}, MetricsTiming{}, generatedTokenCounts{answer: 5})
 	// No logger, no file: nothing may be written and no panic may occur.
 }
 
@@ -267,7 +267,7 @@ func TestLogTokenMetricsTPandTG(t *testing.T) {
 		EvalCount:          60,
 		EvalDuration:       3 * time.Second,
 	}
-	s.logTokenMetrics("test-model", m, MetricsTiming{}, nil)
+	s.logTokenMetrics("test-model", m, MetricsTiming{}, generatedTokenCounts{answer: 60})
 
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -289,7 +289,7 @@ func TestLogTokenMetricsTPandTG(t *testing.T) {
 	}
 
 	// Metrics without durations: tp/tg must fall back to 0.
-	s.logTokenMetrics("test-model", api.Metrics{PromptEvalCount: 10, EvalCount: 5}, MetricsTiming{}, nil)
+	s.logTokenMetrics("test-model", api.Metrics{PromptEvalCount: 10, EvalCount: 5}, MetricsTiming{}, generatedTokenCounts{answer: 5})
 	data, err = os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("read back %q error: %v", path, err)
@@ -336,7 +336,7 @@ func TestConcurrentWrites(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for range writes {
-				s.logTokenMetrics("test-model", m, MetricsTiming{}, nil)
+				s.logTokenMetrics("test-model", m, MetricsTiming{}, generatedTokenCounts{answer: evalCount})
 			}
 		}()
 	}

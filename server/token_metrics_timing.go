@@ -6,6 +6,15 @@ import (
 	"github.com/ollama/ollama/api"
 )
 
+func noteFirstGeneratedToken(first *time.Time, now time.Time, content, reasoning string, toolCalls []api.ToolCall) {
+	if first == nil || !first.IsZero() {
+		return
+	}
+	if content != "" || reasoning != "" || len(toolCalls) > 0 {
+		*first = now
+	}
+}
+
 // collectTiming derives the timing breakdown from the observed request
 // timestamps and the runner metrics. requestStart is the wall-clock time the
 // request was received; firstToken is the time of the first streamed content

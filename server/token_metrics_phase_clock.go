@@ -7,9 +7,7 @@ import (
 )
 
 // The normalized phase names a [StateTransitioner] reports via StateName.
-// [PhaseClock.Note] attributes each state transition time point to the phase
-// bucket the name belongs to: "thinking"/"thinkingDone" to thinkStart,
-// "toolCalling" to toolCallStart, and everything else to answerStart.
+// [PhaseClock.Note] attributes each transition to a generation phase.
 const (
 	phaseStateThinking     = "thinking"
 	phaseStateThinkingDone = "thinkingDone"
@@ -32,18 +30,19 @@ type StateTransitioner interface {
 	StateName() string
 }
 
-// PhaseClock collects the wall-clock time points of the parser phase
-// transitions observed during a single request. It is created per request in
-// the completion handlers and fed from the parser closure on every stream
-// chunk ([Note]); the time points are available at the Done signal via
-// [StartTimes]. The clock is safe for concurrent use.
+// PhaseClock accumulates wall-clock durations for each generation phase. It is
+// created per request and fed from the parser or structured response callback.
+// The clock is safe for concurrent use.
 type PhaseClock struct {
-	mu            sync.Mutex
-	startTime     time.Time
-	thinkStart    time.Time
-	toolCallStart time.Time
-	answerStart   time.Time
-	seen          map[string]bool
+	mu                sync.Mutex
+	startTime         time.Time
+	thinkStart        time.Time
+	toolCallStart     time.Time
+	answerStart       time.Time
+	lastTransition    time.Time
+	activePhase       string
+	reasoningDuration time.Duration
+	toolCallDuration  time.Duration
 }
 
 // Begin records the wall-clock time of the first stream chunk. It is a no-op
@@ -59,13 +58,8 @@ func (pc *PhaseClock) Begin() {
 	}
 }
 
-// Note attributes the parser's last state transition time point to the phase
-// bucket the parser's current state belongs to. The time point of the most
-// recent transition of a bucket wins, so when both "thinking" and
-// "thinkingDone" are observed the recorded thinkStart is the transition to
-// "thinkingDone" (the end of the reasoning phase). A state name that was
-// already recorded is not processed again. A zero transition time (no
-// transition yet) is ignored.
+// Note records parser transitions. Repeated state names are accepted when
+// their transition timestamps differ, allowing multiple tool-call phases.
 func (pc *PhaseClock) Note(parser StateTransitioner) {
 	if pc == nil || parser == nil {
 		return
@@ -74,30 +68,70 @@ func (pc *PhaseClock) Note(parser StateTransitioner) {
 	if t.IsZero() {
 		return
 	}
-	name := parser.StateName()
+	pc.NotePhase(parser.StateName(), t)
+}
+
+// NotePhase records a transition from structured output, such as native chat.
+func (pc *PhaseClock) NotePhase(name string, t time.Time) {
+	if pc == nil || t.IsZero() {
+		return
+	}
 
 	pc.mu.Lock()
 	defer pc.mu.Unlock()
-	if pc.seen == nil {
-		pc.seen = make(map[string]bool)
-	}
-	if pc.seen[name] {
+	if pc.startTime.IsZero() || t.Before(pc.startTime) || (!pc.lastTransition.IsZero() && t.Before(pc.lastTransition)) {
 		return
 	}
-	pc.seen[name] = true
-	switch name {
-	case phaseStateThinking, phaseStateThinkingDone:
+	if pc.lastTransition.IsZero() {
+		pc.lastTransition = pc.startTime
+		pc.activePhase = phaseStateAnswer
+	}
+
+	if name == phaseStateThinkingDone {
+		if pc.activePhase == phaseStateThinking {
+			pc.reasoningDuration += t.Sub(pc.lastTransition)
+		} else if pc.reasoningDuration == 0 && pc.thinkStart.IsZero() {
+			pc.reasoningDuration += t.Sub(pc.startTime)
+		} else {
+			pc.closeActivePhase(t)
+		}
 		pc.thinkStart = t
+		pc.activePhase = phaseStateAnswer
+		pc.lastTransition = t
+		return
+	}
+
+	pc.closeActivePhase(t)
+	switch name {
+	case phaseStateThinking:
+		pc.activePhase = phaseStateThinking
+		if pc.thinkStart.IsZero() {
+			pc.thinkStart = t
+		}
 	case phaseStateToolCalling:
+		pc.activePhase = phaseStateToolCalling
 		pc.toolCallStart = t
 	default:
+		pc.activePhase = phaseStateAnswer
 		pc.answerStart = t
+	}
+	pc.lastTransition = t
+}
+
+func (pc *PhaseClock) closeActivePhase(at time.Time) {
+	if pc.lastTransition.IsZero() || !at.After(pc.lastTransition) {
+		return
+	}
+	switch pc.activePhase {
+	case phaseStateThinking:
+		pc.reasoningDuration += at.Sub(pc.lastTransition)
+	case phaseStateToolCalling:
+		pc.toolCallDuration += at.Sub(pc.lastTransition)
 	}
 }
 
-// StartTimes returns the recorded time points: the time of the first stream
-// chunk and the phase transition time points. Values that were not observed
-// are zero; a nil clock returns all zeros.
+// StartTimes returns the first stream time and the most recently observed
+// transition time for each phase. Unobserved values are zero.
 func (pc *PhaseClock) StartTimes() (startTime, thinkStart, toolCallStart, answerStart time.Time) {
 	if pc == nil {
 		return
@@ -107,17 +141,9 @@ func (pc *PhaseClock) StartTimes() (startTime, thinkStart, toolCallStart, answer
 	return pc.startTime, pc.thinkStart, pc.toolCallStart, pc.answerStart
 }
 
-// Durations derives the phase durations from the recorded time points and
-// the runner-reported total generation duration (evalDuration):
-//
-//	reasoning = thinkStart - startTime (0 if not observed)
-//	toolCall  = toolCallStart - thinkStart (from startTime if no thinking
-//	            phase was observed; 0 if not observed)
-//	answer    = evalDuration - reasoning - toolCall
-//
-// If reasoning and toolCall together exceed evalDuration, they are clamped
-// so that the answer stays non-negative; the three returned values always
-// sum to evalDuration. A nil clock returns (evalDuration, 0, 0).
+// Durations returns accumulated phase durations and assigns remaining
+// runner-reported evaluation time to answer or the currently open phase.
+// The three returned values always sum to evalDuration.
 func (pc *PhaseClock) Durations(evalDuration time.Duration) (answer, reasoning, toolCall time.Duration) {
 	answer = evalDuration
 	if pc == nil {
@@ -125,36 +151,34 @@ func (pc *PhaseClock) Durations(evalDuration time.Duration) (answer, reasoning, 
 	}
 
 	pc.mu.Lock()
-	startTime, thinkStart, toolCallStart := pc.startTime, pc.thinkStart, pc.toolCallStart
+	reasoning = pc.reasoningDuration
+	toolCall = pc.toolCallDuration
+	activePhase := pc.activePhase
 	pc.mu.Unlock()
 
-	if !startTime.IsZero() && !thinkStart.IsZero() {
-		if d := thinkStart.Sub(startTime); d > 0 {
-			reasoning = d
-		}
+	if evalDuration <= 0 {
+		return 0, 0, 0
 	}
-	if !toolCallStart.IsZero() {
-		base := thinkStart
-		if base.IsZero() {
-			base = startTime
-		}
-		if !base.IsZero() {
-			if d := toolCallStart.Sub(base); d > 0 {
-				toolCall = d
-			}
-		}
+	if reasoning < 0 {
+		reasoning = 0
 	}
-
+	if toolCall < 0 {
+		toolCall = 0
+	}
 	if reasoning > evalDuration {
 		reasoning = evalDuration
 	}
-	if reasoning+toolCall > evalDuration {
+	if toolCall > evalDuration-reasoning {
 		toolCall = evalDuration - reasoning
 	}
-	answer = evalDuration - reasoning - toolCall
-	if answer < 0 {
-		answer = 0
+	remaining := evalDuration - reasoning - toolCall
+	switch activePhase {
+	case phaseStateThinking:
+		reasoning += remaining
+	case phaseStateToolCalling:
+		toolCall += remaining
 	}
+	answer = evalDuration - reasoning - toolCall
 	return
 }
 

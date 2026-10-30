@@ -1,74 +1,96 @@
 package server
 
 import (
+	"context"
+	"errors"
+	"strings"
 	"testing"
 	"time"
 )
 
-// fakeSplitParser is a [StateProvider] with simulated parser state: fixed
-// reasoning / tool-call token counts as reported by a parser at the end of a
-// request.
+// fakeSplitParser is a [StateProvider] with fixed per-phase content byte counts.
 type fakeSplitParser struct {
 	thinkingTokens int
 	toolCallTokens int
+	answerTokens   int
 }
 
 func (p fakeSplitParser) ThinkingTokens() int { return p.thinkingTokens }
 func (p fakeSplitParser) ToolCallTokens() int { return p.toolCallTokens }
+func (p fakeSplitParser) AnswerTokens() int   { return p.answerTokens }
 
-func TestSplitGeneratedTokens(t *testing.T) {
-	t.Run("no parser attributes everything to the answer", func(t *testing.T) {
-		reasoning, toolCalls, answer := splitGeneratedTokens(50, nil)
-		if reasoning != 0 || toolCalls != 0 || answer != 50 {
-			t.Errorf("splitGeneratedTokens(50, nil) = (%d, %d, %d), want (0, 0, 50)", reasoning, toolCalls, answer)
+func TestCountGeneratedTokenPhasesUsesTokenizer(t *testing.T) {
+	text := generatedTokenText{}
+	text.addReasoning("reasoning bytes")
+	text.toolCalls.WriteString("tool call bytes")
+	text.addAnswer("answer bytes")
+
+	counts, err := countGeneratedTokenPhases(context.Background(), 50,
+		func(_ context.Context, content string) ([]int, error) {
+			switch content {
+			case "reasoning bytes":
+				return []int{1, 2, 3}, nil
+			case "tool call bytes":
+				return []int{1}, nil
+			case "answer bytes":
+				return []int{1, 2, 3, 4, 5, 6}, nil
+			default:
+				t.Fatalf("unexpected tokenizer input %q", content)
+				return nil, nil
+			}
+		}, text)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if counts != (generatedTokenCounts{reasoning: 15, toolCalls: 5, answer: 30}) {
+		t.Errorf("counts = %+v, want reasoning 15, tool calls 5, answer 30", counts)
+	}
+	if counts.reasoning+counts.toolCalls+counts.answer != 50 {
+		t.Errorf("phase counts sum to %d, want runner count 50", counts.reasoning+counts.toolCalls+counts.answer)
+	}
+}
+
+func TestCountGeneratedTokenPhasesFallbackAndErrors(t *testing.T) {
+	t.Run("no parsed content is attributed to answer", func(t *testing.T) {
+		counts, err := countGeneratedTokenPhases(context.Background(), 9,
+			func(context.Context, string) ([]int, error) {
+				t.Fatal("tokenizer called without phase content")
+				return nil, nil
+			}, generatedTokenText{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if counts != (generatedTokenCounts{answer: 9}) {
+			t.Errorf("counts = %+v, want all 9 tokens attributed to answer", counts)
 		}
 	})
 
-	t.Run("reasoning and tool-call tokens are split out of the total", func(t *testing.T) {
-		parser := fakeSplitParser{thinkingTokens: 10, toolCallTokens: 5}
-		reasoning, toolCalls, answer := splitGeneratedTokens(30, parser)
-		if reasoning != 10 || toolCalls != 5 || answer != 15 {
-			t.Errorf("split = (%d, %d, %d), want (10, 5, 15)", reasoning, toolCalls, answer)
-		}
-		if sum := reasoning + toolCalls + answer; sum != 30 {
-			t.Errorf("sum = %d, want 30", sum)
-		}
-	})
-
-	t.Run("no reasoning and no tool calls", func(t *testing.T) {
-		parser := fakeSplitParser{}
-		reasoning, toolCalls, answer := splitGeneratedTokens(20, parser)
-		if reasoning != 0 || toolCalls != 0 || answer != 20 {
-			t.Errorf("split = (%d, %d, %d), want (0, 0, 20)", reasoning, toolCalls, answer)
+	t.Run("tokenization errors are returned", func(t *testing.T) {
+		text := generatedTokenText{}
+		text.addReasoning("reason")
+		wantErr := errors.New("tokenizer failed")
+		_, err := countGeneratedTokenPhases(context.Background(), 1,
+			func(context.Context, string) ([]int, error) { return nil, wantErr }, text)
+		if !errors.Is(err, wantErr) {
+			t.Errorf("error = %v, want %v", err, wantErr)
 		}
 	})
 
-	t.Run("negative parser counts are clamped to zero", func(t *testing.T) {
-		parser := fakeSplitParser{thinkingTokens: -3, toolCallTokens: -2}
-		reasoning, toolCalls, answer := splitGeneratedTokens(12, parser)
-		if reasoning != 0 || toolCalls != 0 || answer != 12 {
-			t.Errorf("split = (%d, %d, %d), want (0, 0, 12)", reasoning, toolCalls, answer)
+	t.Run("phase text is concatenated before tokenization", func(t *testing.T) {
+		text := generatedTokenText{}
+		text.addAnswer("answer")
+		text.addAnswer(" continues")
+		var got string
+		counts, err := countGeneratedTokenPhases(context.Background(), 2,
+			func(_ context.Context, content string) ([]int, error) {
+				got = content
+				return make([]int, len(strings.Fields(content))), nil
+			}, text)
+		if err != nil {
+			t.Fatal(err)
 		}
-	})
-
-	t.Run("parser counts exceeding the total are clamped to keep the sum", func(t *testing.T) {
-		// The parser may have seen more content than the runner has reported as
-		// EvalCount so far; the attributed counts must then be capped so that
-		// the three parts still sum to evalCount.
-		parser := fakeSplitParser{thinkingTokens: 20, toolCallTokens: 10}
-		reasoning, toolCalls, answer := splitGeneratedTokens(15, parser)
-		if reasoning != 15 || toolCalls != 0 || answer != 0 {
-			t.Errorf("split = (%d, %d, %d), want (15, 0, 0)", reasoning, toolCalls, answer)
-		}
-		if sum := reasoning + toolCalls + answer; sum != 15 {
-			t.Errorf("sum = %d, want 15", sum)
-		}
-	})
-
-	t.Run("zero tokens with no parser", func(t *testing.T) {
-		reasoning, toolCalls, answer := splitGeneratedTokens(0, nil)
-		if reasoning != 0 || toolCalls != 0 || answer != 0 {
-			t.Errorf("splitGeneratedTokens(0, nil) = (%d, %d, %d), want (0, 0, 0)", reasoning, toolCalls, answer)
+		if got != "answer continues" || counts.answer != 2 {
+			t.Errorf("tokenized %q, counts %+v; want %q and two answer tokens", got, counts, "answer continues")
 		}
 	})
 }
@@ -85,19 +107,19 @@ func TestSplitDurations(t *testing.T) {
 
 	t.Run("duration split proportional to token distribution", func(t *testing.T) {
 		// 60/40 split: thinking=3, toolCalls=2, totalAttributed=5
-		parser := fakeSplitParser{thinkingTokens: 3, toolCallTokens: 2}
-		totalEval := 500 * time.Millisecond
+		parser := fakeSplitParser{thinkingTokens: 3, toolCallTokens: 2, answerTokens: 5}
+		totalEval := time.Second
 		answer, reasoning, toolCall := splitDurations(totalEval, parser)
-		// reasoning = 500ms * 3/5 = 300ms, toolCall = 500ms * 2/5 = 200ms
-		// answer = 500ms - 300ms - 200ms = 0
+		// reasoning = 1s * 3/10 = 300ms, toolCall = 1s * 2/10 = 200ms,
+		// answer = 1s * 5/10 = 500ms.
 		if reasoning != 300*time.Millisecond {
 			t.Errorf("reasoning = %v, want 300ms", reasoning)
 		}
 		if toolCall != 200*time.Millisecond {
 			t.Errorf("toolCall = %v, want 200ms", toolCall)
 		}
-		if answer != 0 {
-			t.Errorf("answer = %v, want 0", answer)
+		if answer != 500*time.Millisecond {
+			t.Errorf("answer = %v, want 500ms", answer)
 		}
 		if sum := reasoning + toolCall + answer; sum != totalEval {
 			t.Errorf("sum = %v, want %v", sum, totalEval)
