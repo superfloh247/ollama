@@ -117,6 +117,27 @@ func testLogprobs(tokens ...string) []llm.Logprob {
 	return logprobs
 }
 
+func TestShouldRequestNativeChatLogprobs(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		requested      bool
+		metricsEnabled bool
+		hasTools       bool
+		want           bool
+	}{
+		{name: "metrics without tools", metricsEnabled: true, want: true},
+		{name: "metrics with tools", metricsEnabled: true, hasTools: true},
+		{name: "explicit request with tools", requested: true, hasTools: true, want: true},
+		{name: "disabled metrics", hasTools: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := shouldRequestNativeChatLogprobs(tc.requested, tc.metricsEnabled, tc.hasTools); got != tc.want {
+				t.Errorf("shouldRequestNativeChatLogprobs() = %t, want %t", got, tc.want)
+			}
+		})
+	}
+}
+
 func (mockRunner) Ping(_ context.Context) error { return nil }
 
 func (m mockRunner) ContextLength() int { return m.contextLength }
@@ -624,6 +645,64 @@ func TestNativeChatMetricsUseStructuredReasoningAndToolCalls(t *testing.T) {
 	}
 	if got := entry["time_to_first_token_ms"].(float64); got <= 0 {
 		t.Errorf("TTFT = %v, want nonzero for reasoning-only first chunk", got)
+	}
+}
+
+func TestNativeChatMetricsDoNotRequestLogprobsForStreamingTools(t *testing.T) {
+	t.Setenv("OLLAMA_CONTEXT_LENGTH", "4096")
+	t.Setenv("OLLAMA_GO_TEMPLATE", "0")
+	t.Setenv("OLLAMA_MODELS", t.TempDir())
+	gin.SetMode(gin.TestMode)
+
+	mock := &mockRunner{
+		ChatFn: func(_ context.Context, _ llm.ChatRequest, fn func(llm.ChatResponse)) error {
+			fn(llm.ChatResponse{
+				Message:      api.Message{Role: "assistant", Content: "done"},
+				Done:         true,
+				EvalCount:    1,
+				EvalDuration: time.Millisecond,
+			})
+			return nil
+		},
+	}
+	s := newServerWithMockRunner(t, mock)
+	createMinimalGGUFModel(t, s, "native-tools-metrics", gguftest.KV{
+		"tokenizer.chat_template": "{{ messages[0]['content'] }}",
+	}, "", map[string]any{"capabilities": []any{"completion", "tools"}})
+
+	path := filepath.Join(t.TempDir(), "tokenmetrics.log")
+	logger, err := newTokenMetricsLogger(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer logger.Close()
+	s.metricsLogger = logger
+
+	streaming := true
+	response := createRequest(t, s.ChatHandler, api.ChatRequest{
+		Model: "native-tools-metrics",
+		Messages: []api.Message{
+			{Role: "user", Content: "call the tool"},
+		},
+		Tools: []api.Tool{{
+			Type:     "function",
+			Function: api.ToolFunction{Name: "weather"},
+		}},
+		Stream: &streaming,
+	})
+	if response.Code != http.StatusOK {
+		t.Fatalf("chat status %d: %s", response.Code, response.Body.String())
+	}
+	if mock.ChatRequest.Logprobs {
+		t.Fatal("metrics logging must not request logprobs for streaming tool calls")
+	}
+	if len(mock.ChatRequest.Tools) != 1 {
+		t.Fatalf("native chat request has %d tools, want 1", len(mock.ChatRequest.Tools))
+	}
+	if data, err := os.ReadFile(path); err != nil {
+		t.Fatal(err)
+	} else if len(data) != 0 {
+		t.Fatalf("metrics log = %q, want no row without exact sampled-token data", data)
 	}
 }
 

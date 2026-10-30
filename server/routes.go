@@ -3068,6 +3068,13 @@ func writeChatResponse(c *gin.Context, req api.ChatRequest, ch chan any) {
 	streamResponse(c, ch)
 }
 
+func shouldRequestNativeChatLogprobs(requested, metricsEnabled, hasTools bool) bool {
+	if requested {
+		return true
+	}
+	return metricsEnabled && !hasTools
+}
+
 func (s *Server) ChatHandler(c *gin.Context) {
 	checkpointStart := time.Now()
 
@@ -3593,7 +3600,7 @@ func (s *Server) handleNativeChat(c *gin.Context, req api.ChatRequest, m *Model,
 		Options:     opts,
 		Think:       req.Think,
 		Shift:       req.Shift == nil || *req.Shift,
-		Logprobs:    req.Logprobs || s.metricsLogger != nil,
+		Logprobs:    shouldRequestNativeChatLogprobs(req.Logprobs, s.metricsLogger != nil, len(req.Tools) > 0),
 		TopLogprobs: req.TopLogprobs,
 	}, truncate)
 	if err != nil {
