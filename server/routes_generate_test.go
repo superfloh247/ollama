@@ -648,7 +648,7 @@ func TestNativeChatMetricsUseStructuredReasoningAndToolCalls(t *testing.T) {
 	}
 }
 
-func TestNativeChatMetricsDoNotRequestLogprobsForStreamingTools(t *testing.T) {
+func TestNativeChatToolMetricsLogWithoutLogprobs(t *testing.T) {
 	t.Setenv("OLLAMA_CONTEXT_LENGTH", "4096")
 	t.Setenv("OLLAMA_GO_TEMPLATE", "0")
 	t.Setenv("OLLAMA_MODELS", t.TempDir())
@@ -659,8 +659,13 @@ func TestNativeChatMetricsDoNotRequestLogprobsForStreamingTools(t *testing.T) {
 			fn(llm.ChatResponse{
 				Message:      api.Message{Role: "assistant", Content: "done"},
 				Done:         true,
-				EvalCount:    1,
+				EvalCount:    10,
 				EvalDuration: time.Millisecond,
+				GeneratedTokenPhaseTexts: []llm.GeneratedTokenPhaseText{
+					{Phase: "thinking", Text: "private reasoning"},
+					{Phase: "toolCalling", Text: "weather Paris"},
+					{Phase: "answer", Text: "done"},
+				},
 			})
 			return nil
 		},
@@ -696,13 +701,22 @@ func TestNativeChatMetricsDoNotRequestLogprobsForStreamingTools(t *testing.T) {
 	if mock.ChatRequest.Logprobs {
 		t.Fatal("metrics logging must not request logprobs for streaming tool calls")
 	}
+	if !mock.ChatRequest.CaptureTokenPhaseText {
+		t.Fatal("expected native chat to capture structured phase text for metrics")
+	}
 	if len(mock.ChatRequest.Tools) != 1 {
 		t.Fatalf("native chat request has %d tools, want 1", len(mock.ChatRequest.Tools))
 	}
-	if data, err := os.ReadFile(path); err != nil {
-		t.Fatal(err)
-	} else if len(data) != 0 {
-		t.Fatalf("metrics log = %q, want no row without exact sampled-token data", data)
+	entry := readTokenMetricsEntry(t, path)
+	reasoning := entry["generated_tokens_reasoning"].(float64)
+	toolCalls := entry["generated_tokens_tool_calls"].(float64)
+	answer := entry["generated_tokens_answer"].(float64)
+	if reasoning != 4 || toolCalls != 4 || answer != 2 {
+		t.Errorf("estimated native tool split = reasoning %v, tools %v, answer %v; want 4, 4, 2",
+			reasoning, toolCalls, answer)
+	}
+	if entry["generated_tokens"].(float64) != 10 {
+		t.Errorf("generated total = %v, want 10", entry["generated_tokens"])
 	}
 }
 

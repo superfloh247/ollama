@@ -3014,6 +3014,76 @@ func TestLlamaServerChatLogprobsIncludeStructuredPhases(t *testing.T) {
 	}
 }
 
+func TestLlamaServerChatCapturesToolPhaseTextWithoutLogprobs(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/health":
+			fmt.Fprint(w, `{"status":"ok"}`)
+		case "/v1/chat/completions":
+			var body map[string]json.RawMessage
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Errorf("decode chat request: %v", err)
+			}
+			if _, ok := body["logprobs"]; ok {
+				t.Error("chat request unexpectedly included logprobs")
+			}
+			if _, ok := body["tools"]; !ok {
+				t.Error("chat request did not include tools")
+			}
+			w.Header().Set("Content-Type", "text/event-stream")
+			fmt.Fprintln(w, `data: {"choices":[{"delta":{"reasoning_content":"think"}}]}`)
+			fmt.Fprintln(w, `data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"weather","arguments":"{\"city\":\"Paris\"}"}}]}}]}`)
+			fmt.Fprintln(w, `data: {"choices":[{"delta":{"content":"answer"}}]}`)
+			fmt.Fprintln(w, `data: {"choices":[{"delta":{},"finish_reason":"stop"}],"timings":{"prompt_n":1,"prompt_ms":1,"predicted_n":4,"predicted_ms":4}}`)
+		default:
+			t.Errorf("unexpected path: %s", r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+
+	parts := strings.Split(srv.URL, ":")
+	var portInt int
+	fmt.Sscanf(parts[len(parts)-1], "%d", &portInt)
+	runner := &llamaServerRunner{
+		port:    portInt,
+		cmd:     fakeRunningCmd(),
+		sem:     semaphore.NewWeighted(1),
+		options: api.Options{Runner: api.Runner{NumCtx: 2048}},
+	}
+
+	var responses []ChatResponse
+	opts := api.DefaultOptions()
+	err := runner.Chat(t.Context(), ChatRequest{
+		Messages:              []api.Message{{Role: "user", Content: "test"}},
+		Tools:                 api.Tools{{Type: "function", Function: api.ToolFunction{Name: "weather"}}},
+		Options:               &opts,
+		CaptureTokenPhaseText: true,
+	}, func(cr ChatResponse) {
+		responses = append(responses, cr)
+	})
+	if err != nil {
+		t.Fatalf("Chat error: %v", err)
+	}
+
+	var phaseTexts []GeneratedTokenPhaseText
+	for _, response := range responses {
+		phaseTexts = append(phaseTexts, response.GeneratedTokenPhaseTexts...)
+	}
+	if len(phaseTexts) != 4 {
+		t.Fatalf("got phase texts %+v, want reasoning, tool name, tool arguments, and answer", phaseTexts)
+	}
+	for i, want := range []GeneratedTokenPhaseText{
+		{Phase: "thinking", Text: "think"},
+		{Phase: "toolCalling", Text: "weather"},
+		{Phase: "toolCalling", Text: `{"city":"Paris"}`},
+		{Phase: "answer", Text: "answer"},
+	} {
+		if phaseTexts[i] != want {
+			t.Errorf("phaseTexts[%d] = %+v, want %+v", i, phaseTexts[i], want)
+		}
+	}
+}
+
 func TestLlamaServerCompletionDoneCallbackAfterStreamClosed(t *testing.T) {
 	var completionClosed atomic.Bool
 

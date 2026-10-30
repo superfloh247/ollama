@@ -130,7 +130,7 @@ On Windows, Ollama inherits your user and system environment variables.
 
 Set `OLLAMA_LOG_METRICS=1` to write metrics for completed inference requests to a JSONL file. Each line contains the model, input and generated token counts (including reasoning, tool-call, and answer counts), and timing and token-rate metadata. Prompt and response content are not included.
 
-To attribute generated tokens to each phase, Ollama captures per-token log probabilities while metrics logging is enabled. This adds inference overhead; the captured values are not returned in API responses unless requested.
+To attribute generated tokens to each phase, Ollama captures per-token log probabilities where supported. This adds inference overhead; the captured values are not returned in API responses unless requested. Native chat with tools does not support streamed log probabilities, so Ollama estimates each phase's token share from its tokenized text and reconciles the shares to the runner's generated-token total.
 
 For native chat, the runner reports only total generation duration, not per-phase timings. Ollama estimates reasoning, tool-call, and answer durations in proportion to their generated-token counts; these phase durations sum to the reported total.
 

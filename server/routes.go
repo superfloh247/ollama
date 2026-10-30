@@ -3593,15 +3593,18 @@ func prepareNativeChatRequest(ctx context.Context, m *Model, r llm.LlamaServer, 
 
 func (s *Server) handleNativeChat(c *gin.Context, req api.ChatRequest, m *Model, r llm.LlamaServer, opts *api.Options, msgs []api.Message, checkpointStart, checkpointLoaded time.Time) {
 	truncate := req.Truncate == nil || *req.Truncate
+	runner := r
+	captureTokenPhaseText := s.metricsLogger != nil && len(req.Tools) > 0 && !req.Logprobs
 	nativeReq, err := prepareNativeChatRequest(c.Request.Context(), m, r, opts, llm.ChatRequest{
-		Messages:    msgs,
-		Tools:       req.Tools,
-		Format:      req.Format,
-		Options:     opts,
-		Think:       req.Think,
-		Shift:       req.Shift == nil || *req.Shift,
-		Logprobs:    shouldRequestNativeChatLogprobs(req.Logprobs, s.metricsLogger != nil, len(req.Tools) > 0),
-		TopLogprobs: req.TopLogprobs,
+		Messages:              msgs,
+		Tools:                 req.Tools,
+		Format:                req.Format,
+		Options:               opts,
+		Think:                 req.Think,
+		Shift:                 req.Shift == nil || *req.Shift,
+		Logprobs:              shouldRequestNativeChatLogprobs(req.Logprobs, s.metricsLogger != nil, len(req.Tools) > 0),
+		TopLogprobs:           req.TopLogprobs,
+		CaptureTokenPhaseText: captureTokenPhaseText,
 	}, truncate)
 	if err != nil {
 		slog.Error("chat template prompt error", "error", err)
@@ -3648,6 +3651,7 @@ func (s *Server) handleNativeChat(c *gin.Context, req api.ChatRequest, m *Model,
 		// phaseClock collects phase transitions from the structured response.
 		phaseClock := &PhaseClock{}
 		generatedTokens := newGeneratedTokenCounts(s.metricsLogger != nil)
+		var generatedPhaseTexts []llm.GeneratedTokenPhaseText
 
 		err := r.Chat(c.Request.Context(), nativeReq, func(r llm.ChatResponse) {
 			phaseClock.Begin()
@@ -3663,7 +3667,9 @@ func (s *Server) handleNativeChat(c *gin.Context, req api.ChatRequest, m *Model,
 				phaseClock.NotePhase(phaseStateAnswer, now)
 			}
 			if generatedTokens != nil {
-				if len(r.GeneratedTokenPhases) != len(r.Logprobs) {
+				if captureTokenPhaseText {
+					generatedPhaseTexts = append(generatedPhaseTexts, r.GeneratedTokenPhaseTexts...)
+				} else if len(r.GeneratedTokenPhases) != len(r.Logprobs) {
 					generatedTokens.complete = false
 				} else {
 					for _, phase := range r.GeneratedTokenPhases {
@@ -3702,6 +3708,18 @@ func (s *Server) handleNativeChat(c *gin.Context, req api.ChatRequest, m *Model,
 				// first token and prompt evaluation); native chat reports
 				// structured token phases but not per-phase timestamps.
 				timing := collectTiming(checkpointStart, firstToken, res.Metrics, nil)
+				if captureTokenPhaseText {
+					estimatedCounts, err := estimateGeneratedTokenCounts(
+						c.Request.Context(), runner, generatedPhaseTexts, res.Metrics.EvalCount,
+					)
+					if err != nil {
+						generatedTokens.complete = false
+						slog.Warn("failed to estimate native-chat token phases",
+							"model", req.Model, "error", err)
+					} else {
+						*generatedTokens = *estimatedCounts
+					}
+				}
 				timing.Answer, timing.Reasoning, timing.ToolCall =
 					splitDurationsByGeneratedTokenCounts(res.Metrics.EvalDuration, generatedTokens)
 				// Phase start time points collected from the parser state

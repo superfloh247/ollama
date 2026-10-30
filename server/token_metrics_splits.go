@@ -1,6 +1,8 @@
 package server
 
 import (
+	"context"
+	"fmt"
 	"strings"
 	"time"
 
@@ -252,6 +254,81 @@ func addAnswerTokens(content string, tokens []llm.Logprob, counts *generatedToke
 	for range tokens {
 		counts.addToken(phaseStateAnswer)
 	}
+}
+
+func estimateGeneratedTokenCounts(
+	ctx context.Context,
+	tokenizer interface {
+		Tokenize(context.Context, string) ([]int, error)
+	},
+	phaseTexts []llm.GeneratedTokenPhaseText,
+	total int,
+) (*generatedTokenCounts, error) {
+	counts := newGeneratedTokenCounts(true)
+	if total < 0 {
+		return nil, fmt.Errorf("negative generated token count: %d", total)
+	}
+
+	var texts [3]strings.Builder
+	phaseIndex := map[string]int{
+		phaseStateThinking:    0,
+		phaseStateToolCalling: 1,
+		phaseStateAnswer:      2,
+	}
+	for _, phaseText := range phaseTexts {
+		index, ok := phaseIndex[phaseText.Phase]
+		if !ok {
+			return nil, fmt.Errorf("unknown generated token phase %q", phaseText.Phase)
+		}
+		texts[index].WriteString(phaseText.Text)
+	}
+
+	var phaseCounts [3]int
+	for i := range texts {
+		if texts[i].Len() == 0 {
+			continue
+		}
+		tokens, err := tokenizer.Tokenize(ctx, texts[i].String())
+		if err != nil {
+			return nil, fmt.Errorf("tokenize generated phase %d: %w", i, err)
+		}
+		phaseCounts[i] = len(tokens)
+	}
+
+	totalEstimated := phaseCounts[0] + phaseCounts[1] + phaseCounts[2]
+	if totalEstimated == 0 {
+		if total > 0 {
+			return nil, fmt.Errorf("no generated phase text available for %d output tokens", total)
+		}
+		counts.total = 0
+		return counts, nil
+	}
+
+	allocated := [3]int{}
+	remainders := [3]int{}
+	allocatedTotal := 0
+	for i, phaseCount := range phaseCounts {
+		weighted := phaseCount * total
+		allocated[i] = weighted / totalEstimated
+		remainders[i] = weighted % totalEstimated
+		allocatedTotal += allocated[i]
+	}
+	for remaining := total - allocatedTotal; remaining > 0; remaining-- {
+		best := 0
+		for i := 1; i < len(remainders); i++ {
+			if remainders[i] > remainders[best] {
+				best = i
+			}
+		}
+		allocated[best]++
+		remainders[best] = -1
+	}
+
+	counts.reasoning = allocated[0]
+	counts.toolCalls = allocated[1]
+	counts.answer = allocated[2]
+	counts.total = total
+	return counts, nil
 }
 
 // splitDurations splits the total evaluation duration into the reasoning,

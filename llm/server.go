@@ -234,19 +234,29 @@ type ChatRequest struct {
 
 	Logprobs    bool
 	TopLogprobs int
+	// CaptureTokenPhaseText asks native chat runners to return structured
+	// reasoning, answer, and tool-call text for metrics when logprobs are unavailable.
+	CaptureTokenPhaseText bool
+}
+
+// GeneratedTokenPhaseText holds a text fragment and its generation phase.
+type GeneratedTokenPhaseText struct {
+	Phase string
+	Text  string
 }
 
 type ChatResponse struct {
-	Message               api.Message   `json:"message"`
-	DoneReason            DoneReason    `json:"done_reason"`
-	Done                  bool          `json:"done"`
-	PromptEvalCount       int           `json:"prompt_eval_count"`
-	PromptEvalCachedCount *int          `json:"prompt_eval_cached_count,omitempty"`
-	PromptEvalDuration    time.Duration `json:"prompt_eval_duration"`
-	EvalCount             int           `json:"eval_count"`
-	EvalDuration          time.Duration `json:"eval_duration"`
-	Logprobs              []Logprob     `json:"logprobs,omitempty"`
-	GeneratedTokenPhases  []string      `json:"-"`
+	Message                  api.Message               `json:"message"`
+	DoneReason               DoneReason                `json:"done_reason"`
+	Done                     bool                      `json:"done"`
+	PromptEvalCount          int                       `json:"prompt_eval_count"`
+	PromptEvalCachedCount    *int                      `json:"prompt_eval_cached_count,omitempty"`
+	PromptEvalDuration       time.Duration             `json:"prompt_eval_duration"`
+	EvalCount                int                       `json:"eval_count"`
+	EvalDuration             time.Duration             `json:"eval_duration"`
+	Logprobs                 []Logprob                 `json:"logprobs,omitempty"`
+	GeneratedTokenPhases     []string                  `json:"-"`
+	GeneratedTokenPhaseTexts []GeneratedTokenPhaseText `json:"-"`
 }
 
 // DoneReason represents the reason why a completion response is done
