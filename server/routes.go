@@ -3692,15 +3692,11 @@ func (s *Server) handleNativeChat(c *gin.Context, req api.ChatRequest, m *Model,
 				res.LoadDuration = checkpointLoaded.Sub(checkpointStart)
 
 				// Token metrics logging: derive the timing breakdown (time to
-				// first token, prompt evaluation) and derive the phase
-				// durations from the parser phase transition time points
-				// collected during the request.
+				// first token and prompt evaluation); native chat reports
+				// structured token phases but not per-phase timestamps.
 				timing := collectTiming(checkpointStart, firstToken, res.Metrics, nil)
-				// When no per-phase token data is available, fall back to the wall-clock
-				// phase durations so the reasoning/tool-call split is still reported.
-				if timing.Reasoning == 0 && timing.ToolCall == 0 && res.Metrics.EvalDuration > 0 {
-					timing.Answer, timing.Reasoning, timing.ToolCall = phaseClock.Durations(res.Metrics.EvalDuration)
-				}
+				timing.Answer, timing.Reasoning, timing.ToolCall =
+					splitDurationsByGeneratedTokenCounts(res.Metrics.EvalDuration, generatedTokens)
 				// Phase start time points collected from the parser state
 				// during the request; zero when the phase was not
 				// observed.

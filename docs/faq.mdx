@@ -132,6 +132,8 @@ Set `OLLAMA_LOG_METRICS=1` to write metrics for completed inference requests to 
 
 To attribute generated tokens to each phase, Ollama captures per-token log probabilities while metrics logging is enabled. This adds inference overhead; the captured values are not returned in API responses unless requested.
 
+For native chat, the runner reports only total generation duration, not per-phase timings. Ollama estimates reasoning, tool-call, and answer durations in proportion to their generated-token counts; these phase durations sum to the reported total.
+
 By default, the file is `tokenmetrics.log` in Ollama's log directory: `~/.ollama/logs` on macOS and Linux, or `%LOCALAPPDATA%\Ollama\logs` on Windows. Set `OLLAMA_METRICS_LOG_FILE` to choose a different file path. This variable only takes effect when metrics logging is enabled.
 
 For example, to enable logging and write to a custom path when starting the server:

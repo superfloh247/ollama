@@ -543,6 +543,7 @@ func TestNativeChatMetricsUseStructuredReasoningAndToolCalls(t *testing.T) {
 				Logprobs:             testLogprobs("priv", "ate", " reason", "ing"),
 				GeneratedTokenPhases: []string{"thinking", "thinking", "thinking", "thinking"},
 			})
+			time.Sleep(10 * time.Millisecond)
 			fn(llm.ChatResponse{
 				Message: api.Message{
 					Role: "assistant",
@@ -553,13 +554,14 @@ func TestNativeChatMetricsUseStructuredReasoningAndToolCalls(t *testing.T) {
 				Logprobs:             testLogprobs("weather", "(", "Paris", ")"),
 				GeneratedTokenPhases: []string{"toolCalling", "toolCalling", "toolCalling", "toolCalling"},
 			})
+			time.Sleep(10 * time.Millisecond)
 			fn(llm.ChatResponse{
 				Message:         api.Message{Role: "assistant", Content: "answer words"},
 				Done:            true,
 				DoneReason:      llm.DoneReasonStop,
 				PromptEvalCount: 4,
 				EvalCount:       12,
-				EvalDuration:    time.Second,
+				EvalDuration:    time.Millisecond,
 				Logprobs:        testLogprobs("answer", " ", "words", "."),
 				GeneratedTokenPhases: []string{
 					"answer", "answer", "answer", "answer",
@@ -609,6 +611,16 @@ func TestNativeChatMetricsUseStructuredReasoningAndToolCalls(t *testing.T) {
 	if reasoning != 4 || toolCalls != 4 || answer != 4 {
 		t.Errorf("native split = reasoning %v, tool calls %v, answer %v; want exactly 4 each",
 			reasoning, toolCalls, answer)
+	}
+	reasoningDuration := entry["reasoning_generation_duration_ms"].(float64)
+	toolCallDuration := entry["tool_call_generation_duration_ms"].(float64)
+	answerDuration := entry["answer_generation_duration_ms"].(float64)
+	if reasoningDuration <= 0 || toolCallDuration <= 0 || answerDuration <= 0 {
+		t.Errorf("native durations = reasoning %vms, tool %vms, answer %vms; want all phases nonzero",
+			reasoningDuration, toolCallDuration, answerDuration)
+	}
+	if total := reasoningDuration + toolCallDuration + answerDuration; total < 0.999 || total > 1.001 {
+		t.Errorf("native phase duration sum = %vms, want 1ms EvalDuration", total)
 	}
 	if got := entry["time_to_first_token_ms"].(float64); got <= 0 {
 		t.Errorf("TTFT = %v, want nonzero for reasoning-only first chunk", got)

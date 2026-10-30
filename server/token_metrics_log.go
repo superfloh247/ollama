@@ -67,11 +67,11 @@ func (e tokenMetricsLogEntry) MarshalJSON() ([]byte, error) {
 		ToolCallDuration  float64 `json:"tool_call_generation_duration_ms"`
 	}{
 		entryAlias:        entryAlias(e),
-		TimeToFirstToken:  float64(e.TimeToFirstToken / time.Millisecond),
-		ParseDuration:     float64(e.ParseDuration / time.Millisecond),
-		AnswerDuration:    float64(e.AnswerDuration / time.Millisecond),
-		ReasoningDuration: float64(e.ReasoningDuration / time.Millisecond),
-		ToolCallDuration:  float64(e.ToolCallDuration / time.Millisecond),
+		TimeToFirstToken:  float64(e.TimeToFirstToken) / float64(time.Millisecond),
+		ParseDuration:     float64(e.ParseDuration) / float64(time.Millisecond),
+		AnswerDuration:    float64(e.AnswerDuration) / float64(time.Millisecond),
+		ReasoningDuration: float64(e.ReasoningDuration) / float64(time.Millisecond),
+		ToolCallDuration:  float64(e.ToolCallDuration) / float64(time.Millisecond),
 	})
 }
 
