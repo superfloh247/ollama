@@ -31,16 +31,6 @@ type Nemotron3NanoParser struct {
 	// stateTransition holds the wall-clock time of the last parser state
 	// transition. The zero value means no transition has happened yet.
 	stateTransition time.Time
-	// thinkingTokens counts the bytes of thinking content attributed to the
-	// reasoning phase. It is used as the token-count proxy for [StateProvider].
-	thinkingTokens int
-	// toolCallTokens counts the bytes of tool-call content attributed to the
-	// tool-calling phase. It is used as the token-count proxy for
-	// [StateProvider].
-	toolCallTokens int
-	// answerTokens counts the bytes of answer content attributed to the
-	// answer phase. It is used as the token-count proxy for [StateProvider].
-	answerTokens int
 }
 
 // StateTransitionTime returns the wall-clock time at which the parser last
@@ -69,12 +59,6 @@ func (p *Nemotron3NanoParser) StateName() string {
 	}
 }
 
-// ThinkingTokens returns the number of thinking-content bytes attributed to
-// the reasoning phase, used as the token-count proxy for [StateProvider].
-func (p *Nemotron3NanoParser) ThinkingTokens() int { return p.thinkingTokens }
-
-// ToolCallTokens returns the number of tool-call-content bytes attributed to
-// the tool-calling phase, used as the token-count proxy for [StateProvider].
 // setState transitions the parser to next, recording the wall-clock time of
 // the transition. No time is recorded when the state does not change.
 func (p *Nemotron3NanoParser) setState(next Nemotron3NanoParserState) {

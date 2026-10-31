@@ -3719,8 +3719,7 @@ func (s *Server) handleNativeChat(c *gin.Context, req api.ChatRequest, m *Model,
 						*generatedTokens = *estimatedCounts
 					}
 				}
-				timing.Answer, timing.Reasoning, timing.ToolCall =
-					splitDurationsByGeneratedTokenCounts(res.Metrics.EvalDuration, generatedTokens)
+				timing.Answer, timing.Reasoning, timing.ToolCall = splitDurationsByGeneratedTokenCounts(res.Metrics.EvalDuration, generatedTokens)
 				// Phase start time points collected from the parser state
 				// during the request; zero when the phase was not
 				// observed.

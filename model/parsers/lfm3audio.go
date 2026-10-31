@@ -40,6 +40,7 @@ func (p *LFM3AudioParser) StateTransitionTime() time.Time {
 	}
 	return p.stateTransition
 }
+
 func (p *LFM3AudioParser) StateName() string {
 	switch p.state {
 	case lfm3AudioThinking:
@@ -52,6 +53,7 @@ func (p *LFM3AudioParser) StateName() string {
 		return phaseAnswer
 	}
 }
+
 func (p *LFM3AudioParser) PreservedTokens() []string {
 	return []string{"<think>", "</think>", toolOpenTag, toolCloseTag}
 }

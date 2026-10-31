@@ -45,13 +45,6 @@ type Gemma4Parser struct {
 	// stateTransition holds the wall-clock time of the last parser state
 	// transition. The zero value means no transition has happened yet.
 	stateTransition time.Time
-	// thinkingTokens counts the bytes of thinking content attributed to the
-	// reasoning phase. It is used as the token-count proxy for [StateProvider].
-	thinkingTokens int
-	// toolCallTokens counts the bytes of tool-call content attributed to the
-	// tool-calling phase. It is used as the token-count proxy for
-	// [StateProvider].
-	toolCallTokens int
 	// answerTokens counts the bytes of answer content attributed to the
 	// answer phase. It is used as the token-count proxy for [StateProvider].
 	answerTokens int

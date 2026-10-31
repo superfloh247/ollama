@@ -207,7 +207,7 @@ func metricsStateProvider(parsers ...any) StateProvider {
 		}
 		// A typed-nil pointer (e.g. *thinkingparser.Parser(nil)) is not equal
 		// to nil once stored in an interface, so check for it explicitly.
-		if v := reflect.ValueOf(p); v.Kind() == reflect.Ptr && v.IsNil() {
+		if v := reflect.ValueOf(p); v.Kind() == reflect.Pointer && v.IsNil() {
 			continue
 		}
 		if sp, ok := p.(StateProvider); ok {

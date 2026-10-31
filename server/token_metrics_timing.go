@@ -55,8 +55,7 @@ func collectTimingWithGeneratedTokenCounts(
 		return timing, false
 	}
 
-	timing.Answer, timing.Reasoning, timing.ToolCall =
-		splitDurationsByGeneratedTokenCounts(m.EvalDuration, counts)
+	timing.Answer, timing.Reasoning, timing.ToolCall = splitDurationsByGeneratedTokenCounts(m.EvalDuration, counts)
 	return timing, true
 }
 
