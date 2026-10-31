@@ -50,6 +50,7 @@ func (c *Claude) findPath() (string, error) {
 }
 
 func (c *Claude) Run(model string, models []LaunchModel, args []string) error {
+func (c *Claude) Run(model string, models []LaunchModel, args []string) error {
 	claudePath, err := ensureClaudeInstalled()
 	if err != nil {
 		return err
@@ -168,6 +169,14 @@ func claudeInstallerCommand(goos string) (string, []string, error) {
 	}
 }
 
+// As of 2026-10-19 (cc version 2.1.304), claude code warns the following:
+// CLAUDE_CODE_AUTO_COMPACT_WINDOW="1048576" is too large, so Claude Code treats it as the 1M maximum.
+// Set it to a size from 100k to 1M, such as 200k or 200000, or unset it.
+const (
+	claudeMinAutoCompactWindow = 100_000
+	claudeMaxAutoCompactWindow = 1_000_000
+)
+
 // Claude Code caps output for unrecognized model IDs at 128,000 tokens.
 const claudeMaxOutputTokens = 128_000
 
@@ -195,9 +204,6 @@ func (c *Claude) modelEnvVars(model string, models []LaunchModel) []string {
 		resolved = fallbackLaunchModel(model)
 	}
 	if resolved.Remote || isCloudModelName(model) {
-		if _, set := os.LookupEnv("CLAUDE_CODE_MAX_OUTPUT_TOKENS"); !set && resolved.MaxOutputTokens > 0 {
-			env = append(env, "CLAUDE_CODE_MAX_OUTPUT_TOKENS="+strconv.Itoa(min(resolved.MaxOutputTokens, claudeMaxOutputTokens)))
-		}
 		if ctxLen := resolved.ContextLength; ctxLen > 0 {
 			env = append(env, "CLAUDE_CODE_MAX_CONTEXT_TOKENS="+strconv.Itoa(ctxLen))
 			if os.Getenv("CLAUDE_CODE_AUTO_COMPACT_WINDOW") == "" && ctxLen >= claudeMinAutoCompactWindow {
