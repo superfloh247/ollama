@@ -56,6 +56,11 @@ type Qwen35Parser struct {
 // transitioned to a different state, or the zero time if no transition has
 // happened yet.
 func (p *Qwen35Parser) StateTransitionTime() time.Time {
+	if p.state == qwen35ParserStateCollectingContent {
+		if transition := p.toolParser.StateTransitionTime(); transition.After(p.stateTransition) {
+			return transition
+		}
+	}
 	return p.stateTransition
 }
 
@@ -73,9 +78,8 @@ func (p *Qwen35Parser) AnswerTokens() int { return p.answerTokens }
 
 // StateName returns the normalized name of the parser's current state:
 // "thinking" while the thinking block is being collected, "thinkingDone"
-// directly after the closing tag and "answer" in content (tool calls are
-// delegated to the embedded qwen3-coder parser and do not change the outer
-// state).
+// directly after the closing tag, and the embedded qwen3-coder parser's state
+// while content is being collected.
 func (p *Qwen35Parser) StateName() string {
 	switch p.state {
 	case qwen35ParserStateCollectingThinking:
@@ -83,7 +87,7 @@ func (p *Qwen35Parser) StateName() string {
 	case qwen35ParserStateThinkingDoneEatingWhitespace:
 		return phaseThinkingDone
 	default:
-		return phaseAnswer
+		return p.toolParser.StateName()
 	}
 }
 

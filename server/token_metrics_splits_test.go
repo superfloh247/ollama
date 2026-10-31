@@ -70,6 +70,34 @@ func TestAddParserTokensCountsToolCallTokens(t *testing.T) {
 	}
 }
 
+func TestAddQwen35ParserTokensCountsToolCallTokens(t *testing.T) {
+	parser := parsers.ParserForName("qwen3.5")
+	parser.Init([]api.Tool{{Function: api.ToolFunction{Name: "weather"}}}, nil, &api.ThinkValue{Value: false})
+	tokens := []llm.Logprob{
+		{TokenLogprob: llm.TokenLogprob{Token: "hello"}},
+		{TokenLogprob: llm.TokenLogprob{Token: "<tool_call>\n"}},
+		{TokenLogprob: llm.TokenLogprob{Token: "<function=weather>\n"}},
+		{TokenLogprob: llm.TokenLogprob{Token: "<parameter=city>\n"}},
+		{TokenLogprob: llm.TokenLogprob{Token: "Paris\n"}},
+		{TokenLogprob: llm.TokenLogprob{Token: "</parameter>\n"}},
+		{TokenLogprob: llm.TokenLogprob{Token: "</function>\n"}},
+		{TokenLogprob: llm.TokenLogprob{Token: "</tool_call>"}},
+		{TokenLogprob: llm.TokenLogprob{Token: "done"}},
+	}
+	counts := newGeneratedTokenCounts(true)
+
+	content, _, calls, err := addParserTokens(parser, "hello<tool_call>\n<function=weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call>done", true, tokens, counts, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if content != "hellodone" || len(calls) != 1 || calls[0].Function.Name != "weather" {
+		t.Fatalf("parsed content/calls = %q/%+v, want %q and one weather call", content, calls, "hellodone")
+	}
+	if counts.reasoning != 0 || counts.toolCalls != 7 || counts.answer != 2 || counts.total != 9 || !counts.complete {
+		t.Errorf("counts = %+v, want 7 tool-call and 2 answer tokens", counts)
+	}
+}
+
 func TestAddParserTokensRejectsUnalignedTokenData(t *testing.T) {
 	parser := parsers.ParserForName("passthrough")
 	parser.Init(nil, nil, nil)
