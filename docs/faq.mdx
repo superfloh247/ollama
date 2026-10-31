@@ -136,6 +136,8 @@ For native chat, the runner reports only total generation duration, not per-phas
 
 By default, the file is `tokenmetrics.log` in Ollama's log directory: `~/.ollama/logs` on macOS and Linux, or `%LOCALAPPDATA%\Ollama\logs` on Windows. Set `OLLAMA_METRICS_LOG_FILE` to choose a different file path. This variable only takes effect when metrics logging is enabled.
 
+The file is append-only; Ollama does not rotate or delete it. Monitor its size and manage rotation and retention through your deployment's log-management process.
+
 For example, to enable logging and write to a custom path when starting the server:
 
 ```shell
