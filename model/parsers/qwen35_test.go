@@ -60,6 +60,40 @@ func TestQwen35ParserXMLToolCall(t *testing.T) {
 	}
 }
 
+func TestQwen35ParserToolCallByteCountsAreIncremental(t *testing.T) {
+	parser := ParserForName("qwen3.5")
+	if parser == nil {
+		t.Fatal("expected qwen3.5 parser")
+	}
+
+	parser.Init([]api.Tool{{Function: api.ToolFunction{Name: "weather"}}}, nil, &api.ThinkValue{Value: false})
+	state, ok := parser.(interface{ ToolCallTokens() int })
+	if !ok {
+		t.Fatal("expected qwen3.5 parser to report tool-call byte counts")
+	}
+
+	firstCall := "<tool_call><function=weather><parameter=city>\nParis\n</parameter></function></tool_call>"
+	secondCall := "<tool_call><function=weather><parameter=city>\nLondon\n</parameter></function></tool_call>"
+	firstCallBytes := len(firstCall) - len("<tool_call>") - len("</tool_call>")
+	secondCallBytes := len(secondCall) - len("<tool_call>") - len("</tool_call>")
+
+	for _, chunk := range []struct {
+		text string
+		want int
+	}{
+		{firstCall, firstCallBytes},
+		{secondCall, firstCallBytes + secondCallBytes},
+		{"Answer.", firstCallBytes + secondCallBytes},
+	} {
+		if _, _, _, err := parser.Add(chunk.text, false); err != nil {
+			t.Fatalf("parse chunk %q: %v", chunk.text, err)
+		}
+		if got := state.ToolCallTokens(); got != chunk.want {
+			t.Errorf("ToolCallTokens() after %q = %d, want %d", chunk.text, got, chunk.want)
+		}
+	}
+}
+
 func TestQwen35ParserThinkingWithExplicitOpeningTag(t *testing.T) {
 	parser := ParserForName("qwen3.5")
 	if parser == nil {

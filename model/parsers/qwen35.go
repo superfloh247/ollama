@@ -132,9 +132,6 @@ func (p *Qwen35Parser) Init(tools []api.Tool, lastMessage *api.Message, thinkVal
 	p.thinkingTokens = 0
 	p.toolCallTokens = 0
 	p.answerTokens = 0
-	p.answerTokens = 0
-	p.answerTokens = 0
-	p.answerTokens = 0
 	p.toolParser.Init(tools, nil, nil)
 
 	thinkingEnabled := thinkValue != nil && thinkValue.Bool()
@@ -181,11 +178,13 @@ func (p *Qwen35Parser) Add(s string, done bool) (content string, thinking string
 	for _, event := range events {
 		switch event := event.(type) {
 		case qwen35EventContent:
+			toolCallTokensBefore := p.toolParser.ToolCallTokens()
 			parsedContent, _, parsedCalls, err := p.toolParser.Add(event.content, done)
 			if err != nil {
 				slog.Warn("qwen3.5 tool call parsing failed", "error", err)
 				return "", "", nil, err
 			}
+			p.toolCallTokens += p.toolParser.ToolCallTokens() - toolCallTokensBefore
 			contentSb.WriteString(parsedContent)
 			p.answerTokens += len(parsedContent)
 			calls = append(calls, parsedCalls...)
@@ -193,7 +192,6 @@ func (p *Qwen35Parser) Add(s string, done bool) (content string, thinking string
 			thinkingSb.WriteString(event.content)
 			p.thinkingTokens += len(event.content)
 		}
-		p.toolCallTokens += p.toolParser.ToolCallTokens()
 	}
 
 	return contentSb.String(), thinkingSb.String(), calls, nil

@@ -57,10 +57,9 @@ type GlimmerParser struct {
 	// tool-calling phase. It is used as the token-count proxy for
 	// [StateProvider].
 	toolCallTokens int
-	// answerTokens counts answer bytes.
-	answerTokens int
 	// answerTokens counts the bytes of answer content attributed to the
 	// answer phase. It is used as the token-count proxy for [StateProvider].
+	answerTokens int
 }
 
 // StateTransitionTime returns the wall-clock time at which the parser last
@@ -137,7 +136,6 @@ func (p *GlimmerParser) Init(tools []api.Tool, lastMessage *api.Message, thinkVa
 	p.contentStreamed = false
 	p.thinkingTokens = 0
 	p.toolCallTokens = 0
-	p.answerTokens = 0
 	p.answerTokens = 0
 	return tools
 }

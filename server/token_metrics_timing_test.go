@@ -89,3 +89,27 @@ func TestCollectTiming(t *testing.T) {
 		}
 	})
 }
+
+func TestCollectTimingUsesExactGeneratedTokenPhases(t *testing.T) {
+	requestStart := time.Date(2026, 10, 14, 12, 0, 0, 0, time.UTC)
+	metrics := api.Metrics{EvalCount: 10, EvalDuration: time.Second}
+	parser := fakeSplitParser{thinkingTokens: 10, toolCallTokens: 0, answerTokens: 10}
+	counts := &generatedTokenCounts{
+		reasoning: 2,
+		toolCalls: 3,
+		answer:    5,
+		total:     10,
+		complete:  true,
+	}
+
+	timing, exact := collectTimingWithGeneratedTokenCounts(requestStart, time.Time{}, metrics, parser, counts)
+	if !exact {
+		t.Fatal("expected exact generated token phases to be used")
+	}
+	if timing.Reasoning != 200*time.Millisecond || timing.ToolCall != 300*time.Millisecond || timing.Answer != 500*time.Millisecond {
+		t.Errorf("timing = %+v, want answer=500ms reasoning=200ms toolCall=300ms", timing)
+	}
+	if timing.Reasoning+timing.ToolCall+timing.Answer != metrics.EvalDuration {
+		t.Fatalf("phase durations do not sum to eval duration: %+v", timing)
+	}
+}

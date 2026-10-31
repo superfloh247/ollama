@@ -45,10 +45,9 @@ type Qwen3CoderParser struct {
 	// tool-calling phase. It is used as the token-count proxy for
 	// [StateProvider].
 	toolCallTokens int
-	// answerTokens
-	answerTokens int
 	// answerTokens counts the bytes of answer content attributed to the
 	// answer phase. It is used as the token-count proxy for [StateProvider].
+	answerTokens int
 }
 
 // StateTransitionTime returns the wall-clock time at which the parser last
@@ -80,7 +79,6 @@ func (p *Qwen3CoderParser) StateName() string {
 	return phaseAnswer
 }
 
-// ThinkingTokens returns the number of thinking-content bytes attributed to
 func (p *Qwen3CoderParser) setState(next qwenParserState) {
 	if p.state == next {
 		return
@@ -110,10 +108,12 @@ func (p *Qwen3CoderParser) PreservedTokens() []string {
 
 func (p *Qwen3CoderParser) Init(tools []api.Tool, lastMessage *api.Message, thinkValue *api.ThinkValue) []api.Tool {
 	p.tools = tools
+	p.acc.Reset()
 	p.callIndex = 0
+	p.state = qwenParserState_LookingForToolStart
+	p.stateTransition = time.Time{}
 	p.thinkingTokens = 0
 	p.toolCallTokens = 0
-	p.answerTokens = 0
 	p.answerTokens = 0
 	return tools // Qwen doesn't modify tools
 }

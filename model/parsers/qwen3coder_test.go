@@ -1372,3 +1372,34 @@ func TestQwen3CoderParserStateTransitionTime(t *testing.T) {
 		t.Fatal("expected non-zero StateTransitionTime after a tool call")
 	}
 }
+
+func TestQwen3CoderParserInitResetsStreamingState(t *testing.T) {
+	p := &Qwen3CoderParser{}
+	p.Init(nil, nil, nil)
+
+	if _, _, _, err := p.Add("<tool_call>incomplete", false); err != nil {
+		t.Fatalf("parse incomplete tool call: %v", err)
+	}
+	if p.StateName() != phaseToolCalling {
+		t.Fatalf("StateName() = %q, want %q", p.StateName(), phaseToolCalling)
+	}
+	if p.StateTransitionTime().IsZero() {
+		t.Fatal("expected tool-call state transition time")
+	}
+
+	p.Init(nil, nil, nil)
+	if p.StateName() != phaseAnswer {
+		t.Fatalf("StateName() after Init = %q, want %q", p.StateName(), phaseAnswer)
+	}
+	if !p.StateTransitionTime().IsZero() {
+		t.Fatalf("StateTransitionTime() after Init = %v, want zero", p.StateTransitionTime())
+	}
+
+	content, _, _, err := p.Add("answer", true)
+	if err != nil {
+		t.Fatalf("parse answer after reinitialization: %v", err)
+	}
+	if content != "answer" {
+		t.Fatalf("content after reinitialization = %q, want %q", content, "answer")
+	}
+}

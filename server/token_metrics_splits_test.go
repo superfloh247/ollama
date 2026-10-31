@@ -7,6 +7,8 @@ import (
 	"github.com/ollama/ollama/api"
 	"github.com/ollama/ollama/llm"
 	"github.com/ollama/ollama/model/parsers"
+	thinkingparser "github.com/ollama/ollama/thinking"
+	"github.com/ollama/ollama/tools"
 )
 
 // fakeSplitParser is a [StateProvider] with fixed per-phase content byte counts.
@@ -67,6 +69,63 @@ func TestAddParserTokensCountsToolCallTokens(t *testing.T) {
 	}
 	if counts.reasoning != 0 || counts.toolCalls != 7 || counts.answer != 2 || counts.total != 9 || !counts.complete {
 		t.Errorf("counts = %+v, want 7 tool-call and 2 answer tokens", counts)
+	}
+}
+
+func TestAddThinkingAndToolTokensCountsToolCallsAfterThinking(t *testing.T) {
+	thinkingParser := &thinkingparser.Parser{OpeningTag: "<think>", ClosingTag: "</think>"}
+	thinkingParser.AddContent("<think>")
+	toolParser := tools.NewParserWithTag(nil, "<tool_call>")
+	tokens := []llm.Logprob{
+		{TokenLogprob: llm.TokenLogprob{Token: "reason"}},
+		{TokenLogprob: llm.TokenLogprob{Token: "</think>"}},
+		{TokenLogprob: llm.TokenLogprob{Token: "<tool_call>"}},
+		{TokenLogprob: llm.TokenLogprob{Token: `{"name":"weather"}`}},
+	}
+	counts := newGeneratedTokenCounts(true)
+
+	addThinkingAndToolTokens(
+		thinkingParser,
+		toolParser,
+		"reason</think><tool_call>{\"name\":\"weather\"}",
+		false,
+		tokens,
+		counts,
+		nil,
+	)
+
+	if counts.reasoning != 2 || counts.toolCalls != 2 || counts.answer != 0 || counts.total != 4 || !counts.complete {
+		t.Errorf("counts = %+v, want 2 reasoning and 2 tool-call tokens", counts)
+	}
+}
+
+func TestAddThinkingAndToolTokensCountsSingleTokenToolCallAfterThinking(t *testing.T) {
+	thinkingParser := &thinkingparser.Parser{OpeningTag: "<think>", ClosingTag: "</think>"}
+	thinkingParser.AddContent("<think>")
+	toolParser := tools.NewParserWithTag([]api.Tool{
+		{Type: "function", Function: api.ToolFunction{Name: "weather"}},
+	}, "<tool_call>")
+	tokens := []llm.Logprob{
+		{TokenLogprob: llm.TokenLogprob{Token: "reason"}},
+		{TokenLogprob: llm.TokenLogprob{Token: "</think>"}},
+		{TokenLogprob: llm.TokenLogprob{Token: `<tool_call>{"name":"weather","arguments":{}}</tool_call>`}},
+	}
+	counts := newGeneratedTokenCounts(true)
+
+	_, _, calls := addThinkingAndToolTokens(
+		thinkingParser,
+		toolParser,
+		"reason</think><tool_call>{\"name\":\"weather\",\"arguments\":{}}</tool_call>",
+		true,
+		tokens,
+		counts,
+		nil,
+	)
+	if len(calls) != 1 || calls[0].Function.Name != "weather" {
+		t.Fatalf("calls = %+v, want one weather call", calls)
+	}
+	if counts.reasoning != 2 || counts.toolCalls != 1 || counts.answer != 0 || counts.total != 3 || !counts.complete {
+		t.Errorf("counts = %+v, want 2 reasoning and 1 tool-call token", counts)
 	}
 }
 

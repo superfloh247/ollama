@@ -834,15 +834,14 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 				res.TotalDuration = time.Since(checkpointStart)
 				res.LoadDuration = checkpointLoaded.Sub(checkpointStart)
 
-				// Token metrics logging: derive the timing breakdown (time to
-				// first token, prompt evaluation) and derive the phase
-				// durations from the parser phase transition time points
-				// collected during the request.
+				// Token metrics logging derives phase durations from exact generated
+				// token phases when available, otherwise from parser state and
+				// transition times collected during the request.
 				metricsParser := metricsStateProvider(builtinParser, thinkTagParser)
-				timing := collectTiming(checkpointStart, firstToken, res.Metrics, metricsParser)
+				timing, exactTokenPhases := collectTimingWithGeneratedTokenCounts(checkpointStart, firstToken, res.Metrics, metricsParser, generatedTokens)
 				// When no per-phase token data is available, fall back to the wall-clock
 				// phase durations so the reasoning/tool-call split is still reported.
-				if timing.Reasoning == 0 && timing.ToolCall == 0 && res.Metrics.EvalDuration > 0 {
+				if !exactTokenPhases && timing.Reasoning == 0 && timing.ToolCall == 0 && res.Metrics.EvalDuration > 0 {
 					timing.Answer, timing.Reasoning, timing.ToolCall = phaseClock.Durations(res.Metrics.EvalDuration)
 				}
 				// Phase start time points collected from the parser state
@@ -3463,8 +3462,8 @@ func (s *Server) ChatHandler(c *gin.Context) {
 					res.TotalDuration = time.Since(checkpointStart)
 					res.LoadDuration = checkpointLoaded.Sub(checkpointStart)
 					metricsParser := metricsStateProvider(builtinParser, thinkTagParser, toolParser)
-					timing := collectTiming(checkpointStart, firstToken, res.Metrics, metricsParser)
-					if timing.Reasoning == 0 && timing.ToolCall == 0 && res.Metrics.EvalDuration > 0 {
+					timing, exactTokenPhases := collectTimingWithGeneratedTokenCounts(checkpointStart, firstToken, res.Metrics, metricsParser, generatedTokens)
+					if !exactTokenPhases && timing.Reasoning == 0 && timing.ToolCall == 0 && res.Metrics.EvalDuration > 0 {
 						timing.Answer, timing.Reasoning, timing.ToolCall = phaseClock.Durations(res.Metrics.EvalDuration)
 					}
 					_, reasoningStart, toolCallStart, answerStart := phaseClock.StartTimes()
@@ -3533,8 +3532,8 @@ func (s *Server) ChatHandler(c *gin.Context) {
 						res.TotalDuration = time.Since(checkpointStart)
 						res.LoadDuration = checkpointLoaded.Sub(checkpointStart)
 						metricsParser := metricsStateProvider(builtinParser, thinkTagParser, toolParser)
-						timing := collectTiming(checkpointStart, firstToken, res.Metrics, metricsParser)
-						if timing.Reasoning == 0 && timing.ToolCall == 0 && res.Metrics.EvalDuration > 0 {
+						timing, exactTokenPhases := collectTimingWithGeneratedTokenCounts(checkpointStart, firstToken, res.Metrics, metricsParser, generatedTokens)
+						if !exactTokenPhases && timing.Reasoning == 0 && timing.ToolCall == 0 && res.Metrics.EvalDuration > 0 {
 							timing.Answer, timing.Reasoning, timing.ToolCall = phaseClock.Durations(res.Metrics.EvalDuration)
 						}
 						_, reasoningStart, toolCallStart, answerStart := phaseClock.StartTimes()
@@ -3555,8 +3554,8 @@ func (s *Server) ChatHandler(c *gin.Context) {
 				res.TotalDuration = time.Since(checkpointStart)
 				res.LoadDuration = checkpointLoaded.Sub(checkpointStart)
 				metricsParser := metricsStateProvider(builtinParser, thinkTagParser, toolParser)
-				timing := collectTiming(checkpointStart, firstToken, res.Metrics, metricsParser)
-				if timing.Reasoning == 0 && timing.ToolCall == 0 && res.Metrics.EvalDuration > 0 {
+				timing, exactTokenPhases := collectTimingWithGeneratedTokenCounts(checkpointStart, firstToken, res.Metrics, metricsParser, generatedTokens)
+				if !exactTokenPhases && timing.Reasoning == 0 && timing.ToolCall == 0 && res.Metrics.EvalDuration > 0 {
 					timing.Answer, timing.Reasoning, timing.ToolCall = phaseClock.Durations(res.Metrics.EvalDuration)
 				}
 				_, reasoningStart, toolCallStart, answerStart := phaseClock.StartTimes()

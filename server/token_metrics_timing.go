@@ -42,9 +42,26 @@ func collectTiming(requestStart, firstToken time.Time, m api.Metrics, parser Sta
 	return timing
 }
 
-// splitDurationsByGeneratedTokenCounts estimates native-chat phase durations
-// from its exact sampled-token phase labels. Native chat does not expose
-// per-phase timestamps, and stream callback time can exceed EvalDuration.
+// collectTimingWithGeneratedTokenCounts uses exact sampled-token phase labels
+// for the duration split when they account for every runner-reported token.
+func collectTimingWithGeneratedTokenCounts(
+	requestStart, firstToken time.Time,
+	m api.Metrics,
+	parser StateProvider,
+	counts *generatedTokenCounts,
+) (MetricsTiming, bool) {
+	timing := collectTiming(requestStart, firstToken, m, parser)
+	if counts == nil || !counts.complete || counts.total != m.EvalCount {
+		return timing, false
+	}
+
+	timing.Answer, timing.Reasoning, timing.ToolCall =
+		splitDurationsByGeneratedTokenCounts(m.EvalDuration, counts)
+	return timing, true
+}
+
+// splitDurationsByGeneratedTokenCounts estimates phase durations from exact
+// sampled-token phase labels. Stream callback time can exceed EvalDuration.
 func splitDurationsByGeneratedTokenCounts(total time.Duration, counts *generatedTokenCounts) (answer, reasoning, toolCall time.Duration) {
 	answer = total
 	if total <= 0 || counts == nil {

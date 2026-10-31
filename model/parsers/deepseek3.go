@@ -147,7 +147,6 @@ func (p *DeepSeek3Parser) Init(tools []api.Tool, lastMessage *api.Message, think
 	p.thinkingTokens = 0
 	p.toolCallTokens = 0
 	p.answerTokens = 0
-	p.answerTokens = 0
 	p.setInitialState(lastMessage, tools, thinkValue)
 	return tools
 }

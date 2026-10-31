@@ -199,9 +199,8 @@ func addThinkingAndToolTokens(
 		thinkingAfter := thinkingParser.StateName()
 		toolAfter := toolParser.StateName()
 		phase := tokenPhase(thinkingBefore, thinkingAfter)
-		if thinkingBefore != phaseStateThinking && thinkingBefore != phaseStateThinkingDone &&
-			thinkingAfter != phaseStateThinking && thinkingAfter != phaseStateThinkingDone {
-			phase = tokenPhase(toolBefore, toolAfter)
+		if toolBefore == phaseStateToolCalling || toolAfter == phaseStateToolCalling || len(parsedCalls) > 0 {
+			phase = phaseStateToolCalling
 		}
 		counts.addToken(phase)
 		reasoningBuilder.WriteString(thought)
