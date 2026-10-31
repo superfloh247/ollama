@@ -33,9 +33,7 @@ func (r *LFM3Renderer) AudioPrompt(req AudioRequest) (AudioPrompt, error) {
 		{Role: "user", Images: []api.ImageData{req.Audio}},
 	}}
 	// Audio and Omni don't think; any other variant must not reason here.
-	if r.Thinking() != nil {
-		prompt.Think = &api.ThinkValue{Value: false}
-	}
+	prompt.Think = &api.ThinkValue{Value: false}
 	return prompt, nil
 }
 

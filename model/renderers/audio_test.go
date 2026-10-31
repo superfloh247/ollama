@@ -58,10 +58,10 @@ func TestAudioPrompts(t *testing.T) {
 		user     string
 		think    *bool
 	}{
-		{"lfm3-audio", AudioRequest{}, "Perform ASR.", "", nil},
-		{"lfm3-audio", AudioRequest{Source: fr, Prompt: "ignored"}, "Perform ASR in French.", "", nil},
-		{"lfm3-omni", AudioRequest{Task: AudioTranslate, Target: language.English}, "Convert the speech to written English.", "", nil},
-		{"lfm3-omni", AudioRequest{Task: AudioTranslate, Source: fr, Target: de}, "Convert the speech in French to written German.", "", nil},
+		{"lfm3-audio", AudioRequest{}, "Perform ASR.", "", new(false)},
+		{"lfm3-audio", AudioRequest{Source: fr, Prompt: "ignored"}, "Perform ASR in French.", "", new(false)},
+		{"lfm3-omni", AudioRequest{Task: AudioTranslate, Target: language.English}, "Convert the speech to written English.", "", new(false)},
+		{"lfm3-omni", AudioRequest{Task: AudioTranslate, Source: fr, Target: de}, "Convert the speech in French to written German.", "", new(false)},
 		{"lfm3", AudioRequest{}, "Perform ASR.", "", new(false)},
 		{"gemma4", AudioRequest{}, "", "Transcribe the following speech segment in its original language. " + gemma4AudioFormat + "[img]", new(false)},
 		{"gemma4", AudioRequest{Source: fr}, "", "Transcribe the following speech segment in French into French text.\n\n" + gemma4AudioFormat + "[img]", new(false)},
