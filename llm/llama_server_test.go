@@ -469,7 +469,9 @@ func writeLargeLlamaServerEvent(t *testing.T, w io.Writer, chat bool, payload st
 	}
 }
 
-func TestLlamaServerCompletionForwardsRepeatLastNZero(t *testing.T) {
+// repeat_last_n reaches llama-server unchanged, except Ollama's -1 (the whole
+// context), which llama-server rejects and so becomes the context size.
+func TestLlamaServerForwardsRepeatLastN(t *testing.T) {
 	var completionBody map[string]any
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -505,21 +507,27 @@ func TestLlamaServerCompletionForwardsRepeatLastNZero(t *testing.T) {
 		options: api.Options{Runner: api.Runner{NumCtx: 2048}},
 	}
 
-	opts := api.DefaultOptions()
-	opts.RepeatLastN = 0
-	if err := runner.Completion(t.Context(), CompletionRequest{
-		Prompt:  "test prompt",
-		Options: &opts,
-	}, func(CompletionResponse) {}); err != nil {
-		t.Fatalf("Completion error: %v", err)
-	}
+	for _, tt := range []struct{ repeatLastN, want int }{{0, 0}, {64, 64}, {-1, 2048}} {
+		t.Run(fmt.Sprint(tt.repeatLastN), func(t *testing.T) {
+			opts := api.DefaultOptions()
+			opts.RepeatLastN = tt.repeatLastN
 
-	value, ok := completionBody["repeat_last_n"]
-	if !ok {
-		t.Fatal("repeat_last_n missing from llama-server completion request")
-	}
-	if value != float64(0) {
-		t.Fatalf("repeat_last_n = %v, want 0", value)
+			completionBody = nil
+			if err := runner.Completion(t.Context(), CompletionRequest{Prompt: "test prompt", Options: &opts}, func(CompletionResponse) {}); err != nil {
+				t.Fatalf("Completion error: %v", err)
+			}
+			if value, ok := completionBody["repeat_last_n"]; !ok || value != float64(tt.want) {
+				t.Errorf("completion repeat_last_n = %v (present %v), want %d", value, ok, tt.want)
+			}
+
+			chat, err := runner.llamaServerChatRequest(ChatRequest{Options: &opts}, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if chat["repeat_last_n"] != tt.want {
+				t.Errorf("chat repeat_last_n = %v, want %d", chat["repeat_last_n"], tt.want)
+			}
+		})
 	}
 }
 
@@ -1477,13 +1485,28 @@ func TestLlamaServerCompletionBOSOwnership(t *testing.T) {
 			wantPrompt: "<|turn>user\nhello<turn|>\n<|turn>model\n",
 		},
 		{
-			name:       "lfm2 strips renderer bos",
+			// llama.cpp honors an explicit add_bos_token=false for lfm2, so the
+			// renderer's BOS is the only one.
+			name:       "lfm2 explicit add_bos false keeps renderer bos",
 			leadingBOS: "<|startoftext|>",
 			ggufKV: gguftest.KV{
 				"general.architecture":         "lfm2",
 				"tokenizer.ggml.model":         "gpt2",
 				"tokenizer.ggml.pre":           "lfm2",
 				"tokenizer.ggml.add_bos_token": false,
+				"tokenizer.ggml.bos_token_id":  uint32(0),
+			},
+			prompt:     "<|startoftext|><|im_start|>user\nhello<|im_end|>\n<|im_start|>assistant\n",
+			wantPrompt: "<|startoftext|><|im_start|>user\nhello<|im_end|>\n<|im_start|>assistant\n",
+		},
+		{
+			name:       "lfm2 explicit add_bos true strips renderer bos",
+			leadingBOS: "<|startoftext|>",
+			ggufKV: gguftest.KV{
+				"general.architecture":         "lfm2",
+				"tokenizer.ggml.model":         "gpt2",
+				"tokenizer.ggml.pre":           "lfm2",
+				"tokenizer.ggml.add_bos_token": true,
 				"tokenizer.ggml.bos_token_id":  uint32(0),
 			},
 			prompt:     "<|startoftext|><|im_start|>user\nhello<|im_end|>\n<|im_start|>assistant\n",
@@ -2610,15 +2633,20 @@ func TestAppendDraftArgs(t *testing.T) {
 			want:      []string{"base", "--spec-type", "draft-mtp", "--spec-draft-n-max", "8", "--spec-draft-backend-sampling", "--spec-draft-model", "draft.gguf"},
 		},
 		{
-			name:      "DFlash draft omits MTP backend sampling",
-			draftType: draftTypeDFlash,
+			name:      "Eagle3 draft passes its type without MTP backend sampling",
+			draftType: draftTypeEagle3,
 			draftPath: "draft.gguf",
 			opts:      api.Options{Runner: api.Runner{DraftNumPredict: 4}},
-			want:      []string{"base", "--spec-type", "draft-dflash", "--spec-draft-n-max", "4", "--spec-draft-model", "draft.gguf"},
+			want:      []string{"base", "--spec-type", "draft-eagle3", "--spec-draft-n-max", "4", "--spec-draft-model", "draft.gguf"},
+		},
+		{
+			name:      "untyped draft leaves the type to llama-server",
+			draftPath: "draft.gguf",
+			opts:      api.Options{Runner: api.Runner{DraftNumPredict: 4}},
+			want:      []string{"base", "--spec-draft-n-max", "4", "--spec-draft-model", "draft.gguf"},
 		},
 		{
 			name:      "zero draft depth disables speculative decoding",
-			draftType: draftTypeDFlash,
 			draftPath: "draft.gguf",
 			opts:      api.Options{Runner: api.Runner{DraftNumPredict: 0}},
 			want:      []string{"base"},
@@ -2637,17 +2665,46 @@ func TestAppendDraftArgs(t *testing.T) {
 
 func TestExternalDraftType(t *testing.T) {
 	tests := []struct {
-		architecture string
-		want         string
+		name    string
+		kv      gguftest.KV
+		tensors []*gguftest.Tensor
+		want    string
 	}{
-		{architecture: "dflash", want: draftTypeDFlash},
-		{architecture: "qwen35", want: draftTypeMTP},
-		{architecture: "unknown", want: draftTypeMTP},
+		{
+			name: "dflash family is inferred by llama-server",
+			kv:   gguftest.KV{"general.architecture": "dflash"},
+		},
+		{
+			name: "eagle3",
+			kv:   gguftest.KV{"general.architecture": "eagle3"},
+			want: draftTypeEagle3,
+		},
+		{
+			name: "MTP sidecar by nextn key",
+			kv:   gguftest.KV{"general.architecture": "gemma4-assistant", "gemma4-assistant.nextn_predict_layers": uint32(4)},
+			want: draftTypeMTP,
+		},
+		{
+			name: "legacy qwen35 MTP sidecar",
+			kv:   gguftest.KV{"general.architecture": "qwen35"},
+			tensors: []*gguftest.Tensor{
+				testGGUFTensor("mtp.fc.weight", gguf.TensorTypeF32, []uint64{1}),
+			},
+			want: draftTypeMTP,
+		},
+		{
+			name: "qwen35 without MTP markers is inferred by llama-server",
+			kv:   gguftest.KV{"general.architecture": "qwen35"},
+		},
+		{
+			name: "unknown",
+			kv:   gguftest.KV{"general.architecture": "unknown"},
+		},
 	}
 
 	for _, tt := range tests {
-		t.Run(tt.architecture, func(t *testing.T) {
-			path, _ := writeTestGGUF(t, gguftest.KV{"general.architecture": tt.architecture}, nil)
+		t.Run(tt.name, func(t *testing.T) {
+			path, _ := writeTestGGUF(t, tt.kv, tt.tensors)
 			got, err := externalDraftType(path)
 			if err != nil {
 				t.Fatal(err)
@@ -2657,6 +2714,20 @@ func TestExternalDraftType(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("MTP marker in a later shard", func(t *testing.T) {
+		path, _ := writeTestGGUF(t, gguftest.KV{"general.architecture": "qwen35"}, nil)
+		shard, _ := writeTestGGUF(t, gguftest.KV{"general.architecture": "unknown"}, []*gguftest.Tensor{
+			testGGUFTensor("mtp.fc.weight", gguf.TensorTypeF32, []uint64{1}),
+		})
+		got, err := externalDraftType(path, shard)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != draftTypeMTP {
+			t.Fatalf("externalDraftType = %q, want %q", got, draftTypeMTP)
+		}
+	})
 }
 
 func TestHasLegacyQwenMTPDraft(t *testing.T) {
@@ -2845,6 +2916,171 @@ func TestLlamaServerCompletionWithLogprobs(t *testing.T) {
 	}
 	if len(responses[0].Logprobs[0].TopLogprobs) != 2 {
 		t.Errorf("top_logprobs len = %d, want 2", len(responses[0].Logprobs[0].TopLogprobs))
+	}
+}
+
+func TestLlamaServerCompletionFinalResponseIncludesLogprobs(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/health" {
+			fmt.Fprint(w, `{"status":"ok"}`)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprintln(w, `data: {"content":"!","stop":true,"stop_type":"eos","completion_probabilities":[{"token":"!","logprob":-0.2}],"timings":{"prompt_n":1,"prompt_ms":1,"predicted_n":1,"predicted_ms":1}}`)
+	}))
+	defer srv.Close()
+
+	parts := strings.Split(srv.URL, ":")
+	var portInt int
+	fmt.Sscanf(parts[len(parts)-1], "%d", &portInt)
+	runner := &llamaServerRunner{
+		port:    portInt,
+		cmd:     fakeRunningCmd(),
+		sem:     semaphore.NewWeighted(1),
+		options: api.Options{Runner: api.Runner{NumCtx: 2048}},
+	}
+
+	var responses []CompletionResponse
+	opts := api.DefaultOptions()
+	err := runner.Completion(t.Context(), CompletionRequest{
+		Prompt:   "test",
+		Options:  &opts,
+		Logprobs: true,
+	}, func(cr CompletionResponse) {
+		responses = append(responses, cr)
+	})
+	if err != nil {
+		t.Fatalf("Completion error: %v", err)
+	}
+	if len(responses) != 1 {
+		t.Fatalf("got %d responses, want 1", len(responses))
+	}
+	if responses[0].EvalCount != 1 || len(responses[0].Logprobs) != 1 || responses[0].Logprobs[0].Token != "!" {
+		t.Fatalf("final response = %+v, want one eval token with matching logprob", responses[0])
+	}
+}
+
+func TestLlamaServerChatLogprobsIncludeStructuredPhases(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/health":
+			fmt.Fprint(w, `{"status":"ok"}`)
+		case "/v1/chat/completions":
+			w.Header().Set("Content-Type", "text/event-stream")
+			fmt.Fprintln(w, `data: {"choices":[{"delta":{"reasoning_content":"think"},"logprobs":{"content":[{"token":"think","logprob":-0.1}]}}]}`)
+			fmt.Fprintln(w, `data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"weather","arguments":"{}"}}]},"logprobs":{"content":[{"token":"{}","logprob":-0.2}]}}]}`)
+			fmt.Fprintln(w, `data: {"choices":[{"delta":{"content":"answer"},"logprobs":{"content":[{"token":"answer","logprob":-0.3}]}}]}`)
+			fmt.Fprintln(w, `data: {"choices":[{"delta":{},"finish_reason":"stop","logprobs":{"content":[]}}],"timings":{"prompt_n":1,"prompt_ms":1,"predicted_n":3,"predicted_ms":3}}`)
+		default:
+			t.Errorf("unexpected path: %s", r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+
+	parts := strings.Split(srv.URL, ":")
+	var portInt int
+	fmt.Sscanf(parts[len(parts)-1], "%d", &portInt)
+	runner := &llamaServerRunner{
+		port:    portInt,
+		cmd:     fakeRunningCmd(),
+		sem:     semaphore.NewWeighted(1),
+		options: api.Options{Runner: api.Runner{NumCtx: 2048}},
+	}
+
+	var responses []ChatResponse
+	opts := api.DefaultOptions()
+	err := runner.Chat(t.Context(), ChatRequest{
+		Messages: []api.Message{{Role: "user", Content: "test"}},
+		Options:  &opts,
+		Logprobs: true,
+	}, func(cr ChatResponse) {
+		responses = append(responses, cr)
+	})
+	if err != nil {
+		t.Fatalf("Chat error: %v", err)
+	}
+	if len(responses) != 4 {
+		t.Fatalf("got %d responses, want three deltas and final response", len(responses))
+	}
+	for i, want := range []string{"thinking", "toolCalling", "answer"} {
+		if len(responses[i].Logprobs) != 1 || len(responses[i].GeneratedTokenPhases) != 1 ||
+			responses[i].GeneratedTokenPhases[0] != want {
+			t.Errorf("response %d phases/logprobs = %v/%v, want %q and one logprob",
+				i, responses[i].GeneratedTokenPhases, responses[i].Logprobs, want)
+		}
+	}
+	if responses[3].EvalCount != 3 {
+		t.Errorf("final EvalCount = %d, want 3", responses[3].EvalCount)
+	}
+}
+
+func TestLlamaServerChatCapturesToolPhaseTextWithoutLogprobs(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/health":
+			fmt.Fprint(w, `{"status":"ok"}`)
+		case "/v1/chat/completions":
+			var body map[string]json.RawMessage
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Errorf("decode chat request: %v", err)
+			}
+			if _, ok := body["logprobs"]; ok {
+				t.Error("chat request unexpectedly included logprobs")
+			}
+			if _, ok := body["tools"]; !ok {
+				t.Error("chat request did not include tools")
+			}
+			w.Header().Set("Content-Type", "text/event-stream")
+			fmt.Fprintln(w, `data: {"choices":[{"delta":{"reasoning_content":"think"}}]}`)
+			fmt.Fprintln(w, `data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"weather","arguments":"{\"city\":\"Paris\"}"}}]}}]}`)
+			fmt.Fprintln(w, `data: {"choices":[{"delta":{"content":"answer"}}]}`)
+			fmt.Fprintln(w, `data: {"choices":[{"delta":{},"finish_reason":"stop"}],"timings":{"prompt_n":1,"prompt_ms":1,"predicted_n":4,"predicted_ms":4}}`)
+		default:
+			t.Errorf("unexpected path: %s", r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+
+	parts := strings.Split(srv.URL, ":")
+	var portInt int
+	fmt.Sscanf(parts[len(parts)-1], "%d", &portInt)
+	runner := &llamaServerRunner{
+		port:    portInt,
+		cmd:     fakeRunningCmd(),
+		sem:     semaphore.NewWeighted(1),
+		options: api.Options{Runner: api.Runner{NumCtx: 2048}},
+	}
+
+	var responses []ChatResponse
+	opts := api.DefaultOptions()
+	err := runner.Chat(t.Context(), ChatRequest{
+		Messages:              []api.Message{{Role: "user", Content: "test"}},
+		Tools:                 api.Tools{{Type: "function", Function: api.ToolFunction{Name: "weather"}}},
+		Options:               &opts,
+		CaptureTokenPhaseText: true,
+	}, func(cr ChatResponse) {
+		responses = append(responses, cr)
+	})
+	if err != nil {
+		t.Fatalf("Chat error: %v", err)
+	}
+
+	var phaseTexts []GeneratedTokenPhaseText
+	for _, response := range responses {
+		phaseTexts = append(phaseTexts, response.GeneratedTokenPhaseTexts...)
+	}
+	if len(phaseTexts) != 4 {
+		t.Fatalf("got phase texts %+v, want reasoning, tool name, tool arguments, and answer", phaseTexts)
+	}
+	for i, want := range []GeneratedTokenPhaseText{
+		{Phase: "thinking", Text: "think"},
+		{Phase: "toolCalling", Text: "weather"},
+		{Phase: "toolCalling", Text: `{"city":"Paris"}`},
+		{Phase: "answer", Text: "answer"},
+	} {
+		if phaseTexts[i] != want {
+			t.Errorf("phaseTexts[%d] = %+v, want %+v", i, phaseTexts[i], want)
+		}
 	}
 }
 

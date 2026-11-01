@@ -130,6 +130,20 @@ func TestNemotron3NanoParser(t *testing.T) {
 	}
 }
 
+func TestNemotron3NanoParserToolPhaseTransition(t *testing.T) {
+	p := &Nemotron3NanoParser{}
+	p.Init(nil, nil, nil)
+	if _, _, _, err := p.Add("<tool_call>", false); err != nil {
+		t.Fatal(err)
+	}
+	if got := p.StateName(); got != phaseToolCalling {
+		t.Fatalf("state = %q, want %q", got, phaseToolCalling)
+	}
+	if p.StateTransitionTime().IsZero() {
+		t.Fatal("expected tool parser transition timestamp")
+	}
+}
+
 // TestNemotron3NanoParser_Streaming tests streaming behavior for thinking support.
 // Tool call streaming is tested in qwen3coder_test.go.
 func TestNemotron3NanoParser_Streaming(t *testing.T) {

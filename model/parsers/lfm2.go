@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"strconv"
 	"strings"
+	"time"
 	"unicode"
 
 	"github.com/ollama/ollama/api"
@@ -40,6 +41,63 @@ type LFM2Parser struct {
 	needsContentLeadingTrim  bool // trim leading whitespace after </think> tag
 	toolNames                map[string]struct{}
 	hasTools                 bool
+	// stateTransition holds the wall-clock time of the last parser state
+	// transition. The zero value means no transition has happened yet.
+	stateTransition time.Time
+	// thinkingTokens counts the bytes of thinking content attributed to the
+	// reasoning phase. It is used as the token-count proxy for [StateProvider].
+	thinkingTokens int
+	// toolCallTokens counts the bytes of tool-call content attributed to the
+	// tool-calling phase. It is used as the token-count proxy for
+	// [StateProvider].
+	toolCallTokens int
+	// answerTokens counts the bytes of answer content attributed to the
+	// answer phase. It is used as the token-count proxy for [StateProvider].
+	answerTokens int
+}
+
+// StateTransitionTime returns the wall-clock time at which the parser last
+// transitioned to a different state, or the zero time if no transition has
+// happened yet.
+func (p *LFM2Parser) StateTransitionTime() time.Time {
+	return p.stateTransition
+}
+
+// ThinkingTokens returns the number of thinking-content bytes attributed to
+// the reasoning phase, used as the token-count proxy for [StateProvider].
+func (p *LFM2Parser) ThinkingTokens() int { return p.thinkingTokens }
+
+// ToolCallTokens returns the number of tool-call-content bytes attributed to
+// the tool-calling phase, used as the token-count proxy for [StateProvider].
+func (p *LFM2Parser) ToolCallTokens() int { return p.toolCallTokens }
+
+// AnswerTokens returns the number of answer-content bytes attributed to the
+// answer phase, used as the token-count proxy for [StateProvider].
+func (p *LFM2Parser) AnswerTokens() int { return p.answerTokens }
+
+// StateName returns the normalized name of the parser's current state:
+// "thinking" while the thinking block is being collected, "toolCalling"
+// while tool calls are being collected and "answer" otherwise (including
+// the initial state that is still waiting to see whether thinking starts).
+func (p *LFM2Parser) StateName() string {
+	switch p.state {
+	case LFM2CollectingThinking:
+		return phaseThinking
+	case LFM2CollectingToolCalls:
+		return phaseToolCalling
+	default:
+		return phaseAnswer
+	}
+}
+
+// setState transitions the parser to next, recording the wall-clock time of
+// the transition. No time is recorded when the state does not change.
+func (p *LFM2Parser) setState(next LFM2ParserState) {
+	if p.state == next {
+		return
+	}
+	p.stateTransition = time.Now()
+	p.state = next
 }
 
 func (p *LFM2Parser) HasToolSupport() bool {
@@ -92,6 +150,7 @@ func (p *LFM2Parser) Init(tools []api.Tool, lastMessage *api.Message, thinkValue
 	p.toolNames = make(map[string]struct{}, len(tools))
 	p.callIndex = 0
 	p.hasTools = len(tools) > 0
+	p.stateTransition = time.Time{}
 	for _, tool := range tools {
 		if tool.Function.Name != "" {
 			p.toolNames[tool.Function.Name] = struct{}{}
@@ -131,7 +190,7 @@ func (p *LFM2Parser) Add(s string, done bool) (content string, thinking string, 
 		if !strings.HasPrefix(trimmed, lfm2ThinkingOpenTag) {
 			p.buffer.Reset()
 			p.buffer.WriteString(trimmed)
-			p.state = LFM2CollectingContent
+			p.setState(LFM2CollectingContent)
 		}
 	}
 
@@ -148,6 +207,7 @@ func (p *LFM2Parser) Add(s string, done bool) (content string, thinking string, 
 			thinkingSb.WriteString(event.content)
 		case lfm2EventContent:
 			contentSb.WriteString(event.content)
+			p.answerTokens += len(event.content)
 		}
 	}
 
@@ -214,7 +274,7 @@ func (p *LFM2Parser) eat() ([]lfm2Event, bool) {
 			after := trimmed[len(lfm2ThinkingOpenTag):]
 			p.buffer.Reset()
 			p.buffer.WriteString(after)
-			p.state = LFM2CollectingThinking
+			p.setState(LFM2CollectingThinking)
 			p.needsThinkingLeadingTrim = true
 			return events, true
 		}
@@ -225,7 +285,7 @@ func (p *LFM2Parser) eat() ([]lfm2Event, bool) {
 		// Direct answer: no thinking block.
 		p.buffer.Reset()
 		p.buffer.WriteString(trimmed)
-		p.state = LFM2CollectingContent
+		p.setState(LFM2CollectingContent)
 		return events, true
 
 	case LFM2CollectingThinking:
@@ -260,7 +320,7 @@ func (p *LFM2Parser) eat() ([]lfm2Event, bool) {
 
 			p.buffer.Reset()
 			p.buffer.WriteString(remaining)
-			p.state = LFM2CollectingContent
+			p.setState(LFM2CollectingContent)
 			p.needsThinkingLeadingTrim = false
 			// Set flag to trim any additional whitespace that may arrive in later chunks
 			p.needsContentLeadingTrim = len(remaining) == 0
@@ -317,7 +377,7 @@ func (p *LFM2Parser) eat() ([]lfm2Event, bool) {
 
 			p.buffer.Reset()
 			p.buffer.WriteString(remaining)
-			p.state = LFM2CollectingToolCalls
+			p.setState(LFM2CollectingToolCalls)
 
 			if len(contentBefore) > 0 {
 				events = append(events, lfm2EventContent{content: contentBefore})
@@ -345,7 +405,7 @@ func (p *LFM2Parser) eat() ([]lfm2Event, bool) {
 				} else {
 					// No more tool calls, go back to content
 					remaining = strings.TrimLeftFunc(remaining, unicode.IsSpace)
-					p.state = LFM2CollectingContent
+					p.setState(LFM2CollectingContent)
 				}
 
 				p.buffer.Reset()

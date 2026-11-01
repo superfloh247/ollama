@@ -20,3 +20,15 @@ func (p *GLM47Parser) Init(tools []api.Tool, lastMessage *api.Message, thinkValu
 	}
 	return tools
 }
+
+// ThinkingTokens returns the number of thinking-content bytes attributed to
+// the reasoning phase, used as the token-count proxy for [StateProvider].
+func (p *GLM47Parser) ThinkingTokens() int { return p.thinkingTokens }
+
+// ToolCallTokens returns the number of tool-call-content bytes attributed to
+// the tool-calling phase, used as the token-count proxy for [StateProvider].
+func (p *GLM47Parser) ToolCallTokens() int { return p.toolCallTokens }
+
+// AnswerTokens returns the number of answer-content bytes attributed to the
+// answer phase, used as the token-count proxy for [StateProvider].
+func (p *GLM47Parser) AnswerTokens() int { return p.answerTokens }

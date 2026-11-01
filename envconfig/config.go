@@ -218,6 +218,8 @@ var (
 	GoTemplate = BoolWithDefault("OLLAMA_GO_TEMPLATE")
 	// DebugLogRequests logs inference requests to disk for replay/debugging.
 	DebugLogRequests = Bool("OLLAMA_DEBUG_LOG_REQUESTS")
+	// LogMetrics toggles writing token metrics per request to tokenmetrics.log.
+	LogMetrics = Bool("OLLAMA_LOG_METRICS")
 	// KvCacheType is the quantization type for the K/V cache.
 	KvCacheType = String("OLLAMA_KV_CACHE_TYPE")
 	// NoHistory disables readline history.
@@ -249,6 +251,10 @@ func String(s string) func() string {
 var (
 	LLMLibrary = String("OLLAMA_LLM_LIBRARY")
 	Editor     = String("OLLAMA_EDITOR")
+
+	// MetricsLogFile holds the path to the file where token metrics are
+	// written. Empty means a default path within the log directory.
+	MetricsLogFile = String("OLLAMA_METRICS_LOG_FILE")
 
 	CudaVisibleDevices    = String("CUDA_VISIBLE_DEVICES")
 	HipVisibleDevices     = String("HIP_VISIBLE_DEVICES")
@@ -314,6 +320,8 @@ func AsMap() map[string]EnvVar {
 	ret := map[string]EnvVar{
 		"OLLAMA_DEBUG":                {"OLLAMA_DEBUG", LogLevel(), "Show additional debug information (e.g. OLLAMA_DEBUG=1)"},
 		"OLLAMA_DEBUG_LOG_REQUESTS":   {"OLLAMA_DEBUG_LOG_REQUESTS", DebugLogRequests(), "Log inference request bodies and replay curl commands to a temp directory"},
+		"OLLAMA_LOG_METRICS":          {"OLLAMA_LOG_METRICS", LogMetrics(), "Log token metrics per inference to tokenmetrics.log in the log directory"},
+		"OLLAMA_METRICS_LOG_FILE":     {"OLLAMA_METRICS_LOG_FILE", MetricsLogFile(), "Path to the file where token metrics are written (default: <logdir>/tokenmetrics.log)"},
 		"OLLAMA_GO_TEMPLATE":          {"OLLAMA_GO_TEMPLATE", GoTemplate(true), "Enable Modelfile TEMPLATE based rendering when available"},
 		"OLLAMA_FLASH_ATTENTION":      {"OLLAMA_FLASH_ATTENTION", FlashAttention(false), "Enabled flash attention"},
 		"OLLAMA_KV_CACHE_TYPE":        {"OLLAMA_KV_CACHE_TYPE", KvCacheType(), "Quantization type for the K/V cache (default: f16)"},

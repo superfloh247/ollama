@@ -58,6 +58,28 @@ func TestRegisterCustomParser(t *testing.T) {
 	}
 }
 
+func TestBuiltInParsersExposeMetricsPhase(t *testing.T) {
+	names := []string{
+		"qwen3", "qwen3-thinking", "qwen3.5", "ornith", "qwen3-coder",
+		"qwen3-vl-instruct", "qwen3-vl-thinking", "ministral", "passthrough",
+		"harmony", "cogito", "deepseek3", "olmo3", "olmo3-think",
+		"nemotron-3-nano", "functiongemma", "glm-4.7", "flint", "gemma4",
+		"gemma4-no-thinking", "glm-ocr", "lfm2", "lfm2-thinking", "lfm3",
+		"lfm3-omni", "lfm3-audio", "laguna", "poolside-v1", "cohere", "glimmer",
+	}
+	for _, name := range names {
+		t.Run(name, func(t *testing.T) {
+			parser := ParserForName(name)
+			if parser == nil {
+				t.Fatalf("parser %q not found", name)
+			}
+			if _, ok := parser.(interface{ StateName() string }); !ok {
+				t.Errorf("parser %q does not expose a metrics phase", name)
+			}
+		})
+	}
+}
+
 // TestThinkingClose checks that a parser reports the strings ending its
 // thinking exactly when its response begins inside thinking: not when the
 // request turns thinking off, when an assistant prefill continues content, or
