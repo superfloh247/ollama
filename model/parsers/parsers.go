@@ -28,6 +28,15 @@ type Parser interface {
 	HasThinkingSupport() bool
 }
 
+// Normalized phase names exposed by the parsers' optional StateName method;
+// they must match the phase vocabulary of the server package's PhaseClock.
+const (
+	phaseThinking     = "thinking"
+	phaseThinkingDone = "thinkingDone"
+	phaseToolCalling  = "toolCalling"
+	phaseAnswer       = "answer"
+)
+
 type ParserConstructor func() Parser
 
 type ParserRegistry struct {
@@ -145,6 +154,10 @@ func (p *PassthroughParser) HasToolSupport() bool {
 
 func (p *PassthroughParser) HasThinkingSupport() bool {
 	return false
+}
+
+func (p *PassthroughParser) StateName() string {
+	return phaseAnswer
 }
 
 func splitAtTag(sb *strings.Builder, tag string, trimAfter bool) (string, string) {

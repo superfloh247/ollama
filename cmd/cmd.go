@@ -2816,6 +2816,8 @@ func NewCLI() *cobra.Command {
 				envVars["LLAMA_ARG_FIT"],
 				envVars["LLAMA_ARG_FIT_TARGET"],
 				envVars["OLLAMA_LOAD_TIMEOUT"],
+				envVars["OLLAMA_LOG_METRICS"],
+				envVars["OLLAMA_METRICS_LOG_FILE"],
 			})
 		default:
 			appendEnvDocs(cmd, envs)

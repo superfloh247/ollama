@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
@@ -105,6 +107,35 @@ func (mockRunner) Tokenize(_ context.Context, s string) (tokens []int, err error
 	}
 
 	return
+}
+
+func testLogprobs(tokens ...string) []llm.Logprob {
+	logprobs := make([]llm.Logprob, len(tokens))
+	for i, token := range tokens {
+		logprobs[i].Token = token
+	}
+	return logprobs
+}
+
+func TestShouldRequestNativeChatLogprobs(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		requested      bool
+		metricsEnabled bool
+		hasTools       bool
+		want           bool
+	}{
+		{name: "metrics without tools", metricsEnabled: true, want: true},
+		{name: "metrics with tools", metricsEnabled: true, hasTools: true},
+		{name: "explicit request with tools", requested: true, hasTools: true, want: true},
+		{name: "disabled metrics", hasTools: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := shouldRequestNativeChatLogprobs(tc.requested, tc.metricsEnabled, tc.hasTools); got != tc.want {
+				t.Errorf("shouldRequestNativeChatLogprobs() = %t, want %t", got, tc.want)
+			}
+		})
+	}
 }
 
 func (mockRunner) Ping(_ context.Context) error { return nil }
@@ -401,6 +432,7 @@ func TestChatHandlerChatTemplateRoute(t *testing.T) {
 			return nil
 		},
 	}
+
 	s := newServerWithMockRunner(t, &mock)
 	createMinimalGGUFModel(t, s, "chat-template", gguftest.KV{
 		"tokenizer.chat_template": "{{ messages[0]['content'] }}",
@@ -434,6 +466,363 @@ func TestChatHandlerChatTemplateRoute(t *testing.T) {
 	if !mock.ChatRequest.Shift {
 		t.Fatal("expected chat_template route to preserve default cache_prompt shift")
 	}
+}
+
+func TestChatMetricsIncludeFinalParsedChunk(t *testing.T) {
+	t.Setenv("OLLAMA_CONTEXT_LENGTH", "4096")
+	t.Setenv("OLLAMA_GO_TEMPLATE", "1")
+	t.Setenv("OLLAMA_MODELS", t.TempDir())
+	gin.SetMode(gin.TestMode)
+
+	mock := &mockRunner{
+		CompletionFn: func(_ context.Context, _ llm.CompletionRequest, fn func(llm.CompletionResponse)) error {
+			fn(llm.CompletionResponse{
+				Content:   "<think>reasoning ",
+				Logprobs:  testLogprobs("<think>", "reason", "ing", " "),
+				EvalCount: 2,
+			})
+			fn(llm.CompletionResponse{
+				Content:         "one two</think>answer done",
+				Done:            true,
+				DoneReason:      llm.DoneReasonStop,
+				PromptEvalCount: 7,
+				EvalCount:       10,
+				EvalDuration:    time.Second,
+				Logprobs:        testLogprobs("one", " ", "two", "</think>", "answer", " done"),
+			})
+			return nil
+		},
+	}
+	s := newServerWithMockRunner(t, mock)
+	createMinimalGGUFModel(t, s, "metrics-base", nil, "{{ .Prompt }}", map[string]any{
+		"capabilities": []any{"completion", "thinking"},
+	})
+	created := createRequest(t, s.CreateHandler, api.CreateRequest{
+		Model:  "metrics-child",
+		From:   "metrics-base",
+		Parser: "qwen3.5",
+		Stream: &stream,
+	})
+	if created.Code != http.StatusOK {
+		t.Fatalf("create parser model: status %d: %s", created.Code, created.Body.String())
+	}
+
+	path := filepath.Join(t.TempDir(), "tokenmetrics.log")
+	logger, err := newTokenMetricsLogger(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer logger.Close()
+	s.metricsLogger = logger
+
+	streaming := false
+	response := createRequest(t, s.ChatHandler, api.ChatRequest{
+		Model: "metrics-child",
+		Think: &api.ThinkValue{Value: true},
+		Messages: []api.Message{
+			{Role: "user", Content: "hello"},
+		},
+		Stream: &streaming,
+	})
+	if response.Code != http.StatusOK {
+		t.Fatalf("chat status %d: %s", response.Code, response.Body.String())
+	}
+	if !mock.CompletionRequest.Logprobs {
+		t.Fatal("expected metrics logging to enable internal logprob capture")
+	}
+	if strings.Contains(response.Body.String(), "logprobs") {
+		t.Fatal("internal logprobs were exposed in the response")
+	}
+
+	entry := readTokenMetricsEntry(t, path)
+	if got := entry["generated_tokens_reasoning"].(float64); got != 8 {
+		t.Errorf("reasoning tokens = %v, want 8 (including the final parser chunk)", got)
+	}
+	if got := entry["generated_tokens_answer"].(float64); got != 2 {
+		t.Errorf("answer tokens = %v, want 2 (including the final parser chunk)", got)
+	}
+	if got := entry["generated_tokens"].(float64); got != 10 {
+		t.Errorf("generated total = %v, want 10", got)
+	}
+	if got := entry["input_tokens"].(float64); got != 7 {
+		t.Errorf("input tokens = %v, want runner-reported parsed count 7", got)
+	}
+}
+
+func TestNativeChatMetricsUseStructuredReasoningAndToolCalls(t *testing.T) {
+	t.Setenv("OLLAMA_CONTEXT_LENGTH", "4096")
+	t.Setenv("OLLAMA_GO_TEMPLATE", "0")
+	t.Setenv("OLLAMA_MODELS", t.TempDir())
+	gin.SetMode(gin.TestMode)
+
+	args := api.NewToolCallFunctionArguments()
+	args.Set("city", "Paris")
+	mock := &mockRunner{
+		ChatFn: func(_ context.Context, _ llm.ChatRequest, fn func(llm.ChatResponse)) error {
+			fn(llm.ChatResponse{
+				Message:              api.Message{Role: "assistant", Thinking: "private reasoning"},
+				Logprobs:             testLogprobs("priv", "ate", " reason", "ing"),
+				GeneratedTokenPhases: []string{"thinking", "thinking", "thinking", "thinking"},
+			})
+			time.Sleep(10 * time.Millisecond)
+			fn(llm.ChatResponse{
+				Message: api.Message{
+					Role: "assistant",
+					ToolCalls: []api.ToolCall{{
+						Function: api.ToolCallFunction{Name: "weather", Arguments: args},
+					}},
+				},
+				Logprobs:             testLogprobs("weather", "(", "Paris", ")"),
+				GeneratedTokenPhases: []string{"toolCalling", "toolCalling", "toolCalling", "toolCalling"},
+			})
+			time.Sleep(10 * time.Millisecond)
+			fn(llm.ChatResponse{
+				Message:         api.Message{Role: "assistant", Content: "answer words"},
+				Done:            true,
+				DoneReason:      llm.DoneReasonStop,
+				PromptEvalCount: 4,
+				EvalCount:       12,
+				EvalDuration:    time.Millisecond,
+				Logprobs:        testLogprobs("answer", " ", "words", "."),
+				GeneratedTokenPhases: []string{
+					"answer", "answer", "answer", "answer",
+				},
+			})
+			return nil
+		},
+	}
+	s := newServerWithMockRunner(t, mock)
+	createMinimalGGUFModel(t, s, "native-metrics", gguftest.KV{
+		"tokenizer.chat_template": "{{ messages[0]['content'] }}",
+	}, "", map[string]any{"capabilities": []any{"completion", "thinking", "tools"}})
+
+	path := filepath.Join(t.TempDir(), "tokenmetrics.log")
+	logger, err := newTokenMetricsLogger(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer logger.Close()
+	s.metricsLogger = logger
+
+	streaming := false
+	response := createRequest(t, s.ChatHandler, api.ChatRequest{
+		Model: "native-metrics",
+		Messages: []api.Message{
+			{Role: "user", Content: "hello"},
+		},
+		Stream: &streaming,
+	})
+	if response.Code != http.StatusOK {
+		t.Fatalf("chat status %d: %s", response.Code, response.Body.String())
+	}
+	if mock.ChatRequest.Messages == nil {
+		t.Fatal("expected native chat route")
+	}
+	if !mock.ChatRequest.Logprobs {
+		t.Fatal("expected metrics logging to enable internal logprob capture")
+	}
+	if strings.Contains(response.Body.String(), "logprobs") {
+		t.Fatal("internal logprobs were exposed in the response")
+	}
+
+	entry := readTokenMetricsEntry(t, path)
+	reasoning := entry["generated_tokens_reasoning"].(float64)
+	toolCalls := entry["generated_tokens_tool_calls"].(float64)
+	answer := entry["generated_tokens_answer"].(float64)
+	if reasoning != 4 || toolCalls != 4 || answer != 4 {
+		t.Errorf("native split = reasoning %v, tool calls %v, answer %v; want exactly 4 each",
+			reasoning, toolCalls, answer)
+	}
+	reasoningDuration := entry["reasoning_generation_duration_ms"].(float64)
+	toolCallDuration := entry["tool_call_generation_duration_ms"].(float64)
+	answerDuration := entry["answer_generation_duration_ms"].(float64)
+	if reasoningDuration <= 0 || toolCallDuration <= 0 || answerDuration <= 0 {
+		t.Errorf("native durations = reasoning %vms, tool %vms, answer %vms; want all phases nonzero",
+			reasoningDuration, toolCallDuration, answerDuration)
+	}
+	if total := reasoningDuration + toolCallDuration + answerDuration; total < 0.999 || total > 1.001 {
+		t.Errorf("native phase duration sum = %vms, want 1ms EvalDuration", total)
+	}
+	if got := entry["time_to_first_token_ms"].(float64); got <= 0 {
+		t.Errorf("TTFT = %v, want nonzero for reasoning-only first chunk", got)
+	}
+}
+
+func TestNativeChatToolMetricsLogWithoutLogprobs(t *testing.T) {
+	testNativeChatToolMetricsLog(t, false)
+}
+
+func TestNativeChatToolMetricsLogWithLogprobs(t *testing.T) {
+	testNativeChatToolMetricsLog(t, true)
+}
+
+func testNativeChatToolMetricsLog(t *testing.T, requestLogprobs bool) {
+	t.Helper()
+	t.Setenv("OLLAMA_CONTEXT_LENGTH", "4096")
+	t.Setenv("OLLAMA_GO_TEMPLATE", "0")
+	t.Setenv("OLLAMA_MODELS", t.TempDir())
+	gin.SetMode(gin.TestMode)
+
+	mock := &mockRunner{
+		ChatFn: func(_ context.Context, req llm.ChatRequest, fn func(llm.ChatResponse)) error {
+			response := llm.ChatResponse{
+				Message:      api.Message{Role: "assistant", Content: "done"},
+				Done:         true,
+				EvalCount:    10,
+				EvalDuration: time.Millisecond,
+				GeneratedTokenPhaseTexts: []llm.GeneratedTokenPhaseText{
+					{Phase: "thinking", Text: "private reasoning"},
+					{Phase: "toolCalling", Text: "weather Paris"},
+					{Phase: "answer", Text: "done"},
+				},
+			}
+			if req.Logprobs {
+				response.Logprobs = testLogprobs("done")
+			}
+			fn(response)
+			return nil
+		},
+	}
+	s := newServerWithMockRunner(t, mock)
+	createMinimalGGUFModel(t, s, "native-tools-metrics", gguftest.KV{
+		"tokenizer.chat_template": "{{ messages[0]['content'] }}",
+	}, "", map[string]any{"capabilities": []any{"completion", "tools"}})
+
+	path := filepath.Join(t.TempDir(), "tokenmetrics.log")
+	logger, err := newTokenMetricsLogger(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer logger.Close()
+	s.metricsLogger = logger
+
+	streaming := true
+	response := createRequest(t, s.ChatHandler, api.ChatRequest{
+		Model: "native-tools-metrics",
+		Messages: []api.Message{
+			{Role: "user", Content: "call the tool"},
+		},
+		Logprobs: requestLogprobs,
+		Tools: []api.Tool{{
+			Type:     "function",
+			Function: api.ToolFunction{Name: "weather"},
+		}},
+		Stream: &streaming,
+	})
+	if response.Code != http.StatusOK {
+		t.Fatalf("chat status %d: %s", response.Code, response.Body.String())
+	}
+	if mock.ChatRequest.Logprobs != requestLogprobs {
+		t.Errorf("native chat logprobs = %t, want %t", mock.ChatRequest.Logprobs, requestLogprobs)
+	}
+	if !mock.ChatRequest.CaptureTokenPhaseText {
+		t.Fatal("expected native chat to capture structured phase text for metrics")
+	}
+	if gotLogprobs := strings.Contains(response.Body.String(), "logprobs"); gotLogprobs != requestLogprobs {
+		t.Errorf("response contains logprobs = %t, want %t", gotLogprobs, requestLogprobs)
+	}
+	if len(mock.ChatRequest.Tools) != 1 {
+		t.Fatalf("native chat request has %d tools, want 1", len(mock.ChatRequest.Tools))
+	}
+	entry := readTokenMetricsEntry(t, path)
+	reasoning := entry["generated_tokens_reasoning"].(float64)
+	toolCalls := entry["generated_tokens_tool_calls"].(float64)
+	answer := entry["generated_tokens_answer"].(float64)
+	if reasoning != 4 || toolCalls != 4 || answer != 2 {
+		t.Errorf("estimated native tool split = reasoning %v, tools %v, answer %v; want 4, 4, 2",
+			reasoning, toolCalls, answer)
+	}
+	if entry["generated_tokens"].(float64) != 10 {
+		t.Errorf("generated total = %v, want 10", entry["generated_tokens"])
+	}
+}
+
+func TestNativeChatToolPhaseTextStartsTTFTBeforeFinalToolCall(t *testing.T) {
+	t.Setenv("OLLAMA_CONTEXT_LENGTH", "4096")
+	t.Setenv("OLLAMA_GO_TEMPLATE", "0")
+	t.Setenv("OLLAMA_MODELS", t.TempDir())
+	gin.SetMode(gin.TestMode)
+
+	args := api.NewToolCallFunctionArguments()
+	args.Set("city", "Paris")
+	mock := &mockRunner{
+		ChatFn: func(_ context.Context, _ llm.ChatRequest, fn func(llm.ChatResponse)) error {
+			fn(llm.ChatResponse{
+				Message: api.Message{Role: "assistant"},
+				GeneratedTokenPhaseTexts: []llm.GeneratedTokenPhaseText{
+					{Phase: "toolCalling", Text: "weather"},
+				},
+			})
+			time.Sleep(60 * time.Millisecond)
+			fn(llm.ChatResponse{
+				Message: api.Message{
+					Role: "assistant",
+					ToolCalls: []api.ToolCall{{
+						Function: api.ToolCallFunction{Name: "weather", Arguments: args},
+					}},
+				},
+				Done:         true,
+				EvalCount:    2,
+				EvalDuration: 100 * time.Millisecond,
+				GeneratedTokenPhaseTexts: []llm.GeneratedTokenPhaseText{
+					{Phase: "toolCalling", Text: `{"city":"Paris"}`},
+				},
+			})
+			return nil
+		},
+	}
+	s := newServerWithMockRunner(t, mock)
+	createMinimalGGUFModel(t, s, "native-tool-ttft", gguftest.KV{
+		"tokenizer.chat_template": "{{ messages[0]['content'] }}",
+	}, "", map[string]any{"capabilities": []any{"completion", "tools"}})
+
+	path := filepath.Join(t.TempDir(), "tokenmetrics.log")
+	logger, err := newTokenMetricsLogger(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer logger.Close()
+	s.metricsLogger = logger
+
+	streaming := false
+	response := createRequest(t, s.ChatHandler, api.ChatRequest{
+		Model: "native-tool-ttft",
+		Messages: []api.Message{
+			{Role: "user", Content: "call the tool"},
+		},
+		Tools: []api.Tool{{
+			Type:     "function",
+			Function: api.ToolFunction{Name: "weather"},
+		}},
+		Stream: &streaming,
+	})
+	if response.Code != http.StatusOK {
+		t.Fatalf("chat status %d: %s", response.Code, response.Body.String())
+	}
+
+	var chatResponse api.ChatResponse
+	if err := json.Unmarshal(response.Body.Bytes(), &chatResponse); err != nil {
+		t.Fatalf("decode chat response: %v", err)
+	}
+	entry := readTokenMetricsEntry(t, path)
+	timeToFirstToken := time.Duration(entry["time_to_first_token_ms"].(float64) * float64(time.Millisecond))
+	if chatResponse.TotalDuration-timeToFirstToken < 40*time.Millisecond {
+		t.Errorf("TTFT %v is too close to total duration %v; expected it to precede final tool call by at least 40ms",
+			timeToFirstToken, chatResponse.TotalDuration)
+	}
+}
+
+func readTokenMetricsEntry(t *testing.T, path string) map[string]any {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var entry map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(data), &entry); err != nil {
+		t.Fatalf("invalid token metrics JSONL: %v: %s", err, data)
+	}
+	return entry
 }
 
 func TestChatHandlerChatTemplateRouteTruncatesMessages(t *testing.T) {
@@ -601,6 +990,32 @@ func TestParserNameForModelDoesNotChangeConfig(t *testing.T) {
 	m.Config.Parser = "gemma4"
 	if got := parserNameForModel(m); got != "gemma4" {
 		t.Fatalf("explicit parser = %q, want gemma4", got)
+	}
+}
+
+func TestParserNameForModelQwenFamilies(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		family   string
+		families []string
+		want     string
+	}{
+		{name: "legacy Qwen 3", family: "qwen3", want: "qwen3"},
+		{name: "legacy Qwen 3 family list", families: []string{"qwen3"}, want: "qwen3"},
+		{name: "Qwen 3.5", family: "qwen35", want: "qwen3.5"},
+		{name: "Qwen 3.5 family list", families: []string{"qwen35"}, want: "qwen3.5"},
+		{name: "Qwen 3.8", family: "qwen3.8", want: "qwen3.5"},
+		{name: "Qwen 3.8 family list", families: []string{"qwen3.8"}, want: "qwen3.5"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := &Model{Config: model.ConfigV2{
+				ModelFamily:   tc.family,
+				ModelFamilies: tc.families,
+			}}
+			if got := parserNameForModel(m); got != tc.want {
+				t.Errorf("parserNameForModel() = %q, want %q", got, tc.want)
+			}
+		})
 	}
 }
 

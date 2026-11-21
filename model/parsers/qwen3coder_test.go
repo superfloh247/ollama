@@ -1327,3 +1327,79 @@ func TestOverlapFunction(t *testing.T) {
 		})
 	}
 }
+
+func TestQwen3CoderParserStateTransitionTime(t *testing.T) {
+	// note: tags are built from parts to avoid literal tool tags in this file
+	const (
+		toolOpen  = "<" + "tool_call>"
+		toolClose = "</" + "tool_call>"
+	)
+
+	p := &Qwen3CoderParser{}
+	p.Init(nil, nil, nil)
+
+	if !p.StateTransitionTime().IsZero() {
+		t.Fatalf("expected zero StateTransitionTime before any transition, got %v", p.StateTransitionTime())
+	}
+
+	// plain content without any tool call must not record a transition
+	content, _, calls, err := p.Add("no tool calls here", true)
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+	if content != "no tool calls here" {
+		t.Fatalf("expected content %q, got %q", "no tool calls here", content)
+	}
+	if len(calls) != 0 {
+		t.Fatalf("expected no tool calls, got %d", len(calls))
+	}
+	if !p.StateTransitionTime().IsZero() {
+		t.Fatalf("expected zero StateTransitionTime without any tool calls, got %v", p.StateTransitionTime())
+	}
+
+	// a tool call transitions the parser into and out of tool-call collection
+	content, _, calls, err = p.Add(toolOpen+"<function=get_weather><parameter=location>San Francisco</parameter></function>"+toolClose+"done", true)
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+	if content != "done" {
+		t.Fatalf("expected content %q, got %q", "done", content)
+	}
+	if len(calls) != 1 {
+		t.Fatalf("expected 1 tool call, got %d", len(calls))
+	}
+	if p.StateTransitionTime().IsZero() {
+		t.Fatal("expected non-zero StateTransitionTime after a tool call")
+	}
+}
+
+func TestQwen3CoderParserInitResetsStreamingState(t *testing.T) {
+	p := &Qwen3CoderParser{}
+	p.Init(nil, nil, nil)
+
+	if _, _, _, err := p.Add("<tool_call>incomplete", false); err != nil {
+		t.Fatalf("parse incomplete tool call: %v", err)
+	}
+	if p.StateName() != phaseToolCalling {
+		t.Fatalf("StateName() = %q, want %q", p.StateName(), phaseToolCalling)
+	}
+	if p.StateTransitionTime().IsZero() {
+		t.Fatal("expected tool-call state transition time")
+	}
+
+	p.Init(nil, nil, nil)
+	if p.StateName() != phaseAnswer {
+		t.Fatalf("StateName() after Init = %q, want %q", p.StateName(), phaseAnswer)
+	}
+	if !p.StateTransitionTime().IsZero() {
+		t.Fatalf("StateTransitionTime() after Init = %v, want zero", p.StateTransitionTime())
+	}
+
+	content, _, _, err := p.Add("answer", true)
+	if err != nil {
+		t.Fatalf("parse answer after reinitialization: %v", err)
+	}
+	if content != "answer" {
+		t.Fatalf("content after reinitialization = %q, want %q", content, "answer")
+	}
+}

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"time"
 	"unicode"
 
 	"github.com/ollama/ollama/api"
@@ -41,6 +42,65 @@ type GLM46Parser struct {
 	tools           []api.Tool
 	callIndex       int
 	thinkingEnabled bool
+	// stateTransition holds the wall-clock time of the last parser state
+	// transition. The zero value means no transition has happened yet.
+	stateTransition time.Time
+	// thinkingTokens counts the bytes of thinking content attributed to the
+	// reasoning phase. It is used as the token-count proxy for [StateProvider].
+	thinkingTokens int
+	// toolCallTokens counts the bytes of tool-call content attributed to the
+	// tool-calling phase. It is used as the token-count proxy for
+	// [StateProvider].
+	toolCallTokens int
+	// answerTokens counts the bytes of answer content attributed to the
+	// answer phase. It is used as the token-count proxy for [StateProvider].
+	answerTokens int
+}
+
+// StateTransitionTime returns the wall-clock time at which the parser last
+// transitioned to a different state, or the zero time if no transition has
+// happened yet.
+func (p *GLM46Parser) StateTransitionTime() time.Time {
+	return p.stateTransition
+}
+
+// ThinkingTokens returns the number of thinking-content bytes attributed to
+// the reasoning phase, used as the token-count proxy for [StateProvider].
+func (p *GLM46Parser) ThinkingTokens() int { return p.thinkingTokens }
+
+// ToolCallTokens returns the number of tool-call-content bytes attributed to
+// the tool-calling phase, used as the token-count proxy for [StateProvider].
+func (p *GLM46Parser) ToolCallTokens() int { return p.toolCallTokens }
+
+// AnswerTokens returns the number of answer-content bytes attributed to the
+// answer phase, used as the token-count proxy for [StateProvider].
+func (p *GLM46Parser) AnswerTokens() int { return p.answerTokens }
+
+// StateName returns the normalized name of the parser's current state:
+// "thinking" while the thinking block is being collected, "thinkingDone"
+// directly after the closing tag, "toolCalling" in the tool-call region and
+// "answer" otherwise.
+func (p *GLM46Parser) StateName() string {
+	switch p.state {
+	case glm46ParserState_ThinkingStartedEatingWhitespace, glm46ParserState_CollectingThinking:
+		return phaseThinking
+	case glm46ParserState_ThinkingDoneEatingWhitespace:
+		return phaseThinkingDone
+	case glm46ParserState_ToolStartedEatingWhitespace, glm46ParserState_CollectingToolContent:
+		return phaseToolCalling
+	default:
+		return phaseAnswer
+	}
+}
+
+// setState transitions the parser to next, recording the wall-clock time of
+// the transition. No time is recorded when the state does not change.
+func (p *GLM46Parser) setState(next glm46ParserState) {
+	if p.state == next {
+		return
+	}
+	p.stateTransition = time.Now()
+	p.state = next
 }
 
 func (p *GLM46Parser) HasToolSupport() bool {
@@ -75,6 +135,7 @@ func (p *GLM46Parser) PreservedTokens() []string {
 func (p *GLM46Parser) Init(tools []api.Tool, lastMessage *api.Message, thinkValue *api.ThinkValue) []api.Tool {
 	p.tools = tools
 	p.callIndex = 0
+	p.stateTransition = time.Time{}
 	p.thinkingEnabled = thinkValue == nil || thinkValue.Bool()
 	return tools
 }
@@ -134,6 +195,7 @@ func (p *GLM46Parser) Add(s string, done bool) (content string, thinking string,
 			// TODO(drifkin): if the same turn contains multiple interleaved content
 			// events, we naively append them together here.
 			contentSb.WriteString(event.content)
+			p.answerTokens += len(event.content)
 		}
 	}
 
@@ -156,7 +218,7 @@ func (p *GLM46Parser) finalizeToolCall() (glm46EventRawToolCall, error) {
 	}
 
 	p.buffer.Reset()
-	p.state = glm46ParserState_CollectingContent
+	p.setState(glm46ParserState_CollectingContent)
 	return glm46EventRawToolCall{raw: raw}, nil
 }
 
@@ -228,7 +290,7 @@ func (p *GLM46Parser) eatLeadingWhitespaceAndTransitionTo(nextState glm46ParserS
 	if trimmed == "" {
 		return nil, false // Still only whitespace, keep waiting for more input
 	}
-	p.state = nextState
+	p.setState(nextState)
 	p.buffer.WriteString(trimmed)
 	return nil, true // Successfully transitioned
 }
@@ -261,9 +323,9 @@ func (p *GLM46Parser) eat() ([]glm46Event, bool) {
 			p.buffer.Reset()
 			p.buffer.WriteString(after)
 			if after == "" {
-				p.state = glm46ParserState_ThinkingStartedEatingWhitespace
+				p.setState(glm46ParserState_ThinkingStartedEatingWhitespace)
 			} else {
-				p.state = glm46ParserState_CollectingThinking
+				p.setState(glm46ParserState_CollectingThinking)
 			}
 			return events, true
 		} else if strings.HasPrefix(glm46ThinkingOpenTag, trimmed) {
@@ -274,7 +336,7 @@ func (p *GLM46Parser) eat() ([]glm46Event, bool) {
 			return events, false
 		} else {
 			// No thinking tag found, skip to content collection
-			p.state = glm46ParserState_CollectingContent
+			p.setState(glm46ParserState_CollectingContent)
 			// Don't trim - we want to keep the original content
 			return events, true
 		}
@@ -290,9 +352,9 @@ func (p *GLM46Parser) eat() ([]glm46Event, bool) {
 				events = append(events, glm46EventThinkingContent{content: thinking})
 			}
 			if remaining == "" {
-				p.state = glm46ParserState_ThinkingDoneEatingWhitespace
+				p.setState(glm46ParserState_ThinkingDoneEatingWhitespace)
 			} else {
-				p.state = glm46ParserState_CollectingContent
+				p.setState(glm46ParserState_CollectingContent)
 			}
 			return events, true
 		} else if overlapLen := overlap(acc, glm46ThinkingCloseTag); overlapLen > 0 {
@@ -334,9 +396,9 @@ func (p *GLM46Parser) eat() ([]glm46Event, bool) {
 				events = append(events, glm46EventContent{content: before})
 			}
 			if after == "" {
-				p.state = glm46ParserState_ToolStartedEatingWhitespace
+				p.setState(glm46ParserState_ToolStartedEatingWhitespace)
 			} else {
-				p.state = glm46ParserState_CollectingToolContent
+				p.setState(glm46ParserState_CollectingToolContent)
 			}
 			return events, true
 		} else if overlapLen := overlap(p.buffer.String(), glm46ToolOpenTag); overlapLen > 0 {
@@ -377,7 +439,7 @@ func (p *GLM46Parser) eat() ([]glm46Event, bool) {
 				slog.Warn("glm46 tool call closing tag found but no content before it")
 			}
 			events = append(events, glm46EventRawToolCall{raw: toolContent})
-			p.state = glm46ParserState_CollectingContent
+			p.setState(glm46ParserState_CollectingContent)
 			return events, true
 		} else {
 			// Keep accumulating - tool calls are not streamed

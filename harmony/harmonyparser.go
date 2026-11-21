@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"time"
 	"unicode"
 
 	"github.com/ollama/ollama/api"
@@ -269,6 +270,40 @@ type HarmonyMessageHandler struct {
 	toolAccumulator *HarmonyToolCallAccumulator
 	convertedTools  map[string]struct{}
 	contentPrefill  bool // the prompt continues a final-channel message
+	// stateTransition holds the wall-clock time of the last parser state
+	// transition. The zero value means no transition has happened yet.
+	stateTransition time.Time
+}
+
+// StateTransitionTime returns the wall-clock time at which the handler last
+// transitioned to a different state, or the zero time if no transition has
+// happened yet.
+func (h *HarmonyMessageHandler) StateTransitionTime() time.Time {
+	return h.stateTransition
+}
+
+// StateName returns the normalized name of the handler's current state:
+// "thinking" in the analysis channel, "toolCalling" in a tool channel and
+// "answer" otherwise (final/commentary channels).
+func (h *HarmonyMessageHandler) StateName() string {
+	switch h.state {
+	case harmonyMessageState_Thinking:
+		return "thinking"
+	case harmonyMessageState_ToolCalling:
+		return "toolCalling"
+	default:
+		return "answer"
+	}
+}
+
+// setState transitions the handler to next, recording the wall-clock time of
+// the transition. No time is recorded when the state does not change.
+func (h *HarmonyMessageHandler) setState(next harmonyMessageState) {
+	if h.state == next {
+		return
+	}
+	h.stateTransition = time.Now()
+	h.state = next
 }
 
 // NewHarmonyMessageHandler creates a new message handler
@@ -300,23 +335,23 @@ func (h *HarmonyMessageHandler) AddContent(content string, toolParser *HarmonyTo
 			switch event.Header.Channel {
 			case "analysis":
 				if event.Header.Recipient != "" {
-					h.state = harmonyMessageState_ToolCalling
+					h.setState(harmonyMessageState_ToolCalling)
 					// event.Header.Recipient is the tool name, something like
 					// "browser.search" for a built-in, or "functions.calc" for a
 					// custom one
 					toolParser.SetToolName(event.Header.Recipient)
 				} else {
-					h.state = harmonyMessageState_Thinking
+					h.setState(harmonyMessageState_Thinking)
 				}
 			case "commentary":
 				if event.Header.Recipient != "" {
-					h.state = harmonyMessageState_ToolCalling
+					h.setState(harmonyMessageState_ToolCalling)
 					toolParser.SetToolName(event.Header.Recipient)
 				} else {
-					h.state = harmonyMessageState_Normal
+					h.setState(harmonyMessageState_Normal)
 				}
 			case "final":
-				h.state = harmonyMessageState_Normal
+				h.setState(harmonyMessageState_Normal)
 			}
 		case HarmonyEventContentEmitted:
 			logutil.Trace("harmony event content", "content", event.Content, "state", h.state)
@@ -328,7 +363,7 @@ func (h *HarmonyMessageHandler) AddContent(content string, toolParser *HarmonyTo
 				toolContentSb.WriteString(event.Content)
 			}
 		case HarmonyEventMessageEnd:
-			h.state = harmonyMessageState_Normal
+			h.setState(harmonyMessageState_Normal)
 		}
 	}
 	return contentSb.String(), thinkingSb.String(), toolContentSb.String()
@@ -392,6 +427,7 @@ func NewFunctionNameMap() *FunctionNameMap {
 // Init initializes the handler with tools, optional last message, and think value
 // Implements the Parser interface
 func (h *HarmonyMessageHandler) Init(tools []api.Tool, lastMessage *api.Message, thinkValue *api.ThinkValue) []api.Tool {
+	h.stateTransition = time.Time{}
 	// Initialize the harmony parser
 	if h.HarmonyParser == nil {
 		h.HarmonyParser = &HarmonyParser{

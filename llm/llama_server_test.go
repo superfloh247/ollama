@@ -2948,6 +2948,171 @@ func TestLlamaServerCompletionWithLogprobs(t *testing.T) {
 	}
 }
 
+func TestLlamaServerCompletionFinalResponseIncludesLogprobs(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/health" {
+			fmt.Fprint(w, `{"status":"ok"}`)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprintln(w, `data: {"content":"!","stop":true,"stop_type":"eos","completion_probabilities":[{"token":"!","logprob":-0.2}],"timings":{"prompt_n":1,"prompt_ms":1,"predicted_n":1,"predicted_ms":1}}`)
+	}))
+	defer srv.Close()
+
+	parts := strings.Split(srv.URL, ":")
+	var portInt int
+	fmt.Sscanf(parts[len(parts)-1], "%d", &portInt)
+	runner := &llamaServerRunner{
+		port:    portInt,
+		cmd:     fakeRunningCmd(),
+		sem:     semaphore.NewWeighted(1),
+		options: api.Options{Runner: api.Runner{NumCtx: 2048}},
+	}
+
+	var responses []CompletionResponse
+	opts := api.DefaultOptions()
+	err := runner.Completion(t.Context(), CompletionRequest{
+		Prompt:   "test",
+		Options:  &opts,
+		Logprobs: true,
+	}, func(cr CompletionResponse) {
+		responses = append(responses, cr)
+	})
+	if err != nil {
+		t.Fatalf("Completion error: %v", err)
+	}
+	if len(responses) != 1 {
+		t.Fatalf("got %d responses, want 1", len(responses))
+	}
+	if responses[0].EvalCount != 1 || len(responses[0].Logprobs) != 1 || responses[0].Logprobs[0].Token != "!" {
+		t.Fatalf("final response = %+v, want one eval token with matching logprob", responses[0])
+	}
+}
+
+func TestLlamaServerChatLogprobsIncludeStructuredPhases(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/health":
+			fmt.Fprint(w, `{"status":"ok"}`)
+		case "/v1/chat/completions":
+			w.Header().Set("Content-Type", "text/event-stream")
+			fmt.Fprintln(w, `data: {"choices":[{"delta":{"reasoning_content":"think"},"logprobs":{"content":[{"token":"think","logprob":-0.1}]}}]}`)
+			fmt.Fprintln(w, `data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"weather","arguments":"{}"}}]},"logprobs":{"content":[{"token":"{}","logprob":-0.2}]}}]}`)
+			fmt.Fprintln(w, `data: {"choices":[{"delta":{"content":"answer"},"logprobs":{"content":[{"token":"answer","logprob":-0.3}]}}]}`)
+			fmt.Fprintln(w, `data: {"choices":[{"delta":{},"finish_reason":"stop","logprobs":{"content":[]}}],"timings":{"prompt_n":1,"prompt_ms":1,"predicted_n":3,"predicted_ms":3}}`)
+		default:
+			t.Errorf("unexpected path: %s", r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+
+	parts := strings.Split(srv.URL, ":")
+	var portInt int
+	fmt.Sscanf(parts[len(parts)-1], "%d", &portInt)
+	runner := &llamaServerRunner{
+		port:    portInt,
+		cmd:     fakeRunningCmd(),
+		sem:     semaphore.NewWeighted(1),
+		options: api.Options{Runner: api.Runner{NumCtx: 2048}},
+	}
+
+	var responses []ChatResponse
+	opts := api.DefaultOptions()
+	err := runner.Chat(t.Context(), ChatRequest{
+		Messages: []api.Message{{Role: "user", Content: "test"}},
+		Options:  &opts,
+		Logprobs: true,
+	}, func(cr ChatResponse) {
+		responses = append(responses, cr)
+	})
+	if err != nil {
+		t.Fatalf("Chat error: %v", err)
+	}
+	if len(responses) != 4 {
+		t.Fatalf("got %d responses, want three deltas and final response", len(responses))
+	}
+	for i, want := range []string{"thinking", "toolCalling", "answer"} {
+		if len(responses[i].Logprobs) != 1 || len(responses[i].GeneratedTokenPhases) != 1 ||
+			responses[i].GeneratedTokenPhases[0] != want {
+			t.Errorf("response %d phases/logprobs = %v/%v, want %q and one logprob",
+				i, responses[i].GeneratedTokenPhases, responses[i].Logprobs, want)
+		}
+	}
+	if responses[3].EvalCount != 3 {
+		t.Errorf("final EvalCount = %d, want 3", responses[3].EvalCount)
+	}
+}
+
+func TestLlamaServerChatCapturesToolPhaseTextWithoutLogprobs(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/health":
+			fmt.Fprint(w, `{"status":"ok"}`)
+		case "/v1/chat/completions":
+			var body map[string]json.RawMessage
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Errorf("decode chat request: %v", err)
+			}
+			if _, ok := body["logprobs"]; ok {
+				t.Error("chat request unexpectedly included logprobs")
+			}
+			if _, ok := body["tools"]; !ok {
+				t.Error("chat request did not include tools")
+			}
+			w.Header().Set("Content-Type", "text/event-stream")
+			fmt.Fprintln(w, `data: {"choices":[{"delta":{"reasoning_content":"think"}}]}`)
+			fmt.Fprintln(w, `data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"weather","arguments":"{\"city\":\"Paris\"}"}}]}}]}`)
+			fmt.Fprintln(w, `data: {"choices":[{"delta":{"content":"answer"}}]}`)
+			fmt.Fprintln(w, `data: {"choices":[{"delta":{},"finish_reason":"stop"}],"timings":{"prompt_n":1,"prompt_ms":1,"predicted_n":4,"predicted_ms":4}}`)
+		default:
+			t.Errorf("unexpected path: %s", r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+
+	parts := strings.Split(srv.URL, ":")
+	var portInt int
+	fmt.Sscanf(parts[len(parts)-1], "%d", &portInt)
+	runner := &llamaServerRunner{
+		port:    portInt,
+		cmd:     fakeRunningCmd(),
+		sem:     semaphore.NewWeighted(1),
+		options: api.Options{Runner: api.Runner{NumCtx: 2048}},
+	}
+
+	var responses []ChatResponse
+	opts := api.DefaultOptions()
+	err := runner.Chat(t.Context(), ChatRequest{
+		Messages:              []api.Message{{Role: "user", Content: "test"}},
+		Tools:                 api.Tools{{Type: "function", Function: api.ToolFunction{Name: "weather"}}},
+		Options:               &opts,
+		CaptureTokenPhaseText: true,
+	}, func(cr ChatResponse) {
+		responses = append(responses, cr)
+	})
+	if err != nil {
+		t.Fatalf("Chat error: %v", err)
+	}
+
+	var phaseTexts []GeneratedTokenPhaseText
+	for _, response := range responses {
+		phaseTexts = append(phaseTexts, response.GeneratedTokenPhaseTexts...)
+	}
+	if len(phaseTexts) != 4 {
+		t.Fatalf("got phase texts %+v, want reasoning, tool name, tool arguments, and answer", phaseTexts)
+	}
+	for i, want := range []GeneratedTokenPhaseText{
+		{Phase: "thinking", Text: "think"},
+		{Phase: "toolCalling", Text: "weather"},
+		{Phase: "toolCalling", Text: `{"city":"Paris"}`},
+		{Phase: "answer", Text: "answer"},
+	} {
+		if phaseTexts[i] != want {
+			t.Errorf("phaseTexts[%d] = %+v, want %+v", i, phaseTexts[i], want)
+		}
+	}
+}
+
 func TestLlamaServerCompletionDoneCallbackAfterStreamClosed(t *testing.T) {
 	var completionClosed atomic.Bool
 

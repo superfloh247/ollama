@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"time"
 	"unicode"
 
 	"github.com/ollama/ollama/api"
@@ -40,6 +41,62 @@ type LagunaParser struct {
 	thinkingSuppressed    bool
 	allowLeadingThinkOpen bool
 	atContentStart        bool
+	// stateTransition holds the wall-clock time of the last parser state
+	// transition. The zero value means no transition has happened yet.
+	stateTransition time.Time
+	// thinkingTokens counts the bytes of thinking content attributed to the
+	// reasoning phase. It is used as the token-count proxy for [StateProvider].
+	thinkingTokens int
+	// toolCallTokens counts the bytes of tool-call content attributed to the
+	// tool-calling phase. It is used as the token-count proxy for
+	// [StateProvider].
+	toolCallTokens int
+	// answerTokens counts the bytes of answer content attributed to the
+	// answer phase. It is used as the token-count proxy for [StateProvider].
+	answerTokens int
+}
+
+// StateTransitionTime returns the wall-clock time at which the parser last
+// transitioned to a different state, or the zero time if no transition has
+// happened yet.
+func (p *LagunaParser) StateTransitionTime() time.Time {
+	return p.stateTransition
+}
+
+// ThinkingTokens returns the number of thinking-content bytes attributed to
+// the reasoning phase, used as the token-count proxy for [StateProvider].
+func (p *LagunaParser) ThinkingTokens() int { return p.thinkingTokens }
+
+// ToolCallTokens returns the number of tool-call-content bytes attributed to
+// the tool-calling phase, used as the token-count proxy for [StateProvider].
+func (p *LagunaParser) ToolCallTokens() int { return p.toolCallTokens }
+
+// AnswerTokens returns the number of answer-content bytes attributed to the
+// answer phase, used as the token-count proxy for [StateProvider].
+func (p *LagunaParser) AnswerTokens() int { return p.answerTokens }
+
+// StateName returns the normalized name of the parser's current state:
+// "thinking" in the thinking state, "toolCalling" in the tool state and
+// "answer" otherwise.
+func (p *LagunaParser) StateName() string {
+	switch p.state {
+	case lagunaParserStateThinking:
+		return phaseThinking
+	case lagunaParserStateTool:
+		return phaseToolCalling
+	default:
+		return phaseAnswer
+	}
+}
+
+// setState transitions the parser to next, recording the wall-clock time of
+// the transition. No time is recorded when the state does not change.
+func (p *LagunaParser) setState(next lagunaParserState) {
+	if p.state == next {
+		return
+	}
+	p.stateTransition = time.Now()
+	p.state = next
 }
 
 func (p *LagunaParser) HasToolSupport() bool {
@@ -82,6 +139,7 @@ func (p *LagunaParser) Init(tools []api.Tool, lastMessage *api.Message, thinkVal
 	p.thinkingEnabled = thinkValue != nil && thinkValue.Bool()
 	p.thinkingSuppressed = !p.thinkingEnabled
 	p.atContentStart = true
+	p.stateTransition = time.Time{}
 
 	// When the request ends with an assistant prefill, the renderer continues
 	// that turn in place instead of emitting a fresh generation prompt: it has
@@ -131,6 +189,7 @@ func (p *LagunaParser) Add(s string, done bool) (content string, thinking string
 				return "", "", nil, err
 			}
 			contentSB.WriteString(content)
+			p.answerTokens += len(content)
 			calls = append(calls, parsedCalls...)
 		case lagunaParserStateTool:
 			var call api.ToolCall
@@ -180,7 +239,7 @@ func (p *LagunaParser) consumeThinking(done bool) (bool, string) {
 		after := strings.TrimLeftFunc(acc[idx+len(lagunaThinkingCloseTag):], unicode.IsSpace)
 		p.buffer.Reset()
 		p.buffer.WriteString(after)
-		p.state = lagunaParserStateContent
+		p.setState(lagunaParserStateContent)
 		return true, thinking
 	}
 	if idx := strings.Index(acc, lagunaToolCallOpenTag); idx != -1 {
@@ -188,12 +247,12 @@ func (p *LagunaParser) consumeThinking(done bool) (bool, string) {
 		after := acc[idx+len(lagunaToolCallOpenTag):]
 		p.buffer.Reset()
 		p.buffer.WriteString(after)
-		p.state = lagunaParserStateTool
+		p.setState(lagunaParserStateTool)
 		return true, thinking
 	}
 	if done {
 		p.buffer.Reset()
-		p.state = lagunaParserStateContent
+		p.setState(lagunaParserStateContent)
 		acc = strings.TrimRightFunc(acc, unicode.IsSpace)
 		return acc != "", acc
 	}
@@ -229,7 +288,7 @@ func (p *LagunaParser) consumeContent(done bool) (bool, string, []api.ToolCall, 
 			after := strings.TrimLeftFunc(acc[idx+len(lagunaThinkingOpenTag):], unicode.IsSpace)
 			p.buffer.Reset()
 			p.buffer.WriteString(after)
-			p.state = lagunaParserStateThinking
+			p.setState(lagunaParserStateThinking)
 			p.allowLeadingThinkOpen = false
 			return true, content, nil, nil
 		}
@@ -270,7 +329,7 @@ func (p *LagunaParser) consumeContent(done bool) (bool, string, []api.ToolCall, 
 		after := acc[idx+len(lagunaToolCallOpenTag):]
 		p.buffer.Reset()
 		p.buffer.WriteString(after)
-		p.state = lagunaParserStateTool
+		p.setState(lagunaParserStateTool)
 		return true, content, nil, nil
 	}
 	if idx := strings.Index(acc, lagunaUserOpenTag); idx != -1 && len(p.tools) > 0 {
@@ -360,7 +419,7 @@ func (p *LagunaParser) consumeStandaloneJSONTool(done bool) (progress bool, cont
 	call.Function.Index = p.callIndex
 	p.callIndex++
 	p.buffer.Reset()
-	p.state = lagunaParserStateContent
+	p.setState(lagunaParserStateContent)
 	return true, before, call, true, nil
 }
 
@@ -471,7 +530,7 @@ func (p *LagunaParser) consumeTool(done bool) (bool, api.ToolCall, error) {
 		after := strings.TrimLeftFunc(acc[idx+len(lagunaToolCallCloseTag):], unicode.IsSpace)
 		p.buffer.Reset()
 		p.buffer.WriteString(after)
-		p.state = lagunaParserStateContent
+		p.setState(lagunaParserStateContent)
 		call, err := parseLagunaToolCall(raw, p.tools)
 		if err != nil {
 			return false, api.ToolCall{}, err
@@ -482,7 +541,7 @@ func (p *LagunaParser) consumeTool(done bool) (bool, api.ToolCall, error) {
 	}
 	if done && strings.TrimSpace(acc) != "" {
 		p.buffer.Reset()
-		p.state = lagunaParserStateContent
+		p.setState(lagunaParserStateContent)
 		call, err := parseLagunaToolCall(acc, p.tools)
 		if err != nil {
 			return false, api.ToolCall{}, err

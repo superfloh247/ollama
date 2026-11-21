@@ -30,6 +30,13 @@ func (p *LFM3Parser) Add(s string, done bool) (string, string, []api.ToolCall, e
 	return content, "", calls, err
 }
 
+func (p *LFM3Parser) StateName() string {
+	if p.suppress && p.filter.inThinking {
+		return phaseThinking
+	}
+	return p.Qwen35Parser.StateName()
+}
+
 // lfm3ThinkFilter handles LFM3 output with thinking off. After the
 // <think></think> prefill the model may still reason, either in an explicit
 // <think> block or untagged and closed by a second </think> (the publisher

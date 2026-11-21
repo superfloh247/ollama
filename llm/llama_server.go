@@ -1923,6 +1923,7 @@ func (s *llamaServerRunner) Completion(ctx context.Context, req CompletionReques
 					PromptEvalDuration:    time.Duration(lsResp.Timings.PromptMS * float64(time.Millisecond)),
 					EvalCount:             lsResp.Timings.PredictN,
 					EvalDuration:          time.Duration(lsResp.Timings.PredictMS * float64(time.Millisecond)),
+					Logprobs:              convertLogprobs(lsResp.CompletionProbabilities, req.TopLogprobs > 0),
 				}
 				hasFinalResp = true
 			}
@@ -2214,6 +2215,30 @@ func (s *llamaServerRunner) Chat(ctx context.Context, req ChatRequest, fn func(C
 				},
 				Logprobs: convertLogprobs(choice.Logprobs.Content, req.TopLogprobs > 0),
 			}
+			if req.CaptureTokenPhaseText {
+				if choice.Delta.ReasoningContent != "" {
+					resp.GeneratedTokenPhaseTexts = append(resp.GeneratedTokenPhaseTexts, GeneratedTokenPhaseText{
+						Phase: "thinking",
+						Text:  choice.Delta.ReasoningContent,
+					})
+				}
+				if choice.Delta.Content != "" {
+					resp.GeneratedTokenPhaseTexts = append(resp.GeneratedTokenPhaseTexts, GeneratedTokenPhaseText{
+						Phase: "answer",
+						Text:  choice.Delta.Content,
+					})
+				}
+			}
+			phase := "answer"
+			switch {
+			case choice.Delta.ReasoningContent != "":
+				phase = "thinking"
+			case len(choice.Delta.ToolCalls) > 0:
+				phase = "toolCalling"
+			}
+			for range resp.Logprobs {
+				resp.GeneratedTokenPhases = append(resp.GeneratedTokenPhases, phase)
+			}
 
 			for _, tc := range choice.Delta.ToolCalls {
 				acc := toolCalls[tc.Index]
@@ -2222,6 +2247,20 @@ func (s *llamaServerRunner) Chat(ctx context.Context, req ChatRequest, fn func(C
 					toolCalls[tc.Index] = acc
 				}
 				acc.id += tc.ID
+				if req.CaptureTokenPhaseText {
+					if tc.Function.Name != "" {
+						resp.GeneratedTokenPhaseTexts = append(resp.GeneratedTokenPhaseTexts, GeneratedTokenPhaseText{
+							Phase: "toolCalling",
+							Text:  tc.Function.Name,
+						})
+					}
+					if tc.Function.Arguments != "" {
+						resp.GeneratedTokenPhaseTexts = append(resp.GeneratedTokenPhaseTexts, GeneratedTokenPhaseText{
+							Phase: "toolCalling",
+							Text:  tc.Function.Arguments,
+						})
+					}
+				}
 				if tc.Function.Name != "" {
 					acc.name += tc.Function.Name
 				}
@@ -2251,7 +2290,7 @@ func (s *llamaServerRunner) Chat(ctx context.Context, req ChatRequest, fn func(C
 				break
 			}
 
-			if resp.Message.Content != "" || resp.Message.Thinking != "" || len(resp.Logprobs) > 0 {
+			if resp.Message.Content != "" || resp.Message.Thinking != "" || len(resp.Logprobs) > 0 || len(resp.GeneratedTokenPhaseTexts) > 0 {
 				fn(resp)
 			}
 		}
